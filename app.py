@@ -1,6 +1,8 @@
 import base64
+import hashlib
 import io
 import math
+import warnings
 from contextlib import contextmanager
 from functools import lru_cache
 from itertools import combinations
@@ -11,19 +13,28 @@ import plotly.graph_objs as go
 import rasterio
 import requests
 import xarray as xr
-from PIL import Image
-from dash import ALL, ClientsideFunction, Dash, Input, Output, Patch, State, ctx, dcc, html, no_update
+from PIL import Image, ImageColor
+from dash import ALL, ClientsideFunction, Dash, Input, Output, State, ctx, dcc, html, no_update
 from dash.exceptions import PreventUpdate
-from plotly.colors import qualitative
+from flask import Response
+from plotly.colors import qualitative, sample_colorscale
+from rasterio.errors import NotGeoreferencedWarning
 from rasterio.io import MemoryFile
 from rasterio.warp import Resampling, reproject, transform, transform_bounds
 from xrspatial import viewshed
 
 PROJECTED_CRS = "EPSG:26912"  # NAD83 / UTM zone 12N, suitable for Utah
 GEOGRAPHIC_CRS = "EPSG:4326"
+WEB_MERCATOR_CRS = "EPSG:3857"
 WORLDCOVER_BASE_URL = "https://esa-worldcover.s3.eu-central-1.amazonaws.com"
 WORLDCOVER_VERSION = "v200"
 WORLDCOVER_YEAR = "2021"
+OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+OSM_TILE_SIZE = 256
+OSM_MIN_ZOOM = 2
+OSM_MAX_ZOOM = 17
+OSM_MAX_TILE_COUNT = 64
+OSM_TILE_HEADERS = {"User-Agent": "NF-MTP/1.0"}
 
 DEFAULT_BBOX = {
     "min_lon": -113.90,
@@ -45,19 +56,34 @@ MIN_LINK_RSSI_DBM = -140.0
 COLOR_SEQUENCE = qualitative.Dark24 + qualitative.Bold + qualitative.Safe + qualitative.Set3
 ELEVATION_COLOR_SCALE_OPTIONS = ["Magma", "Viridis", "Cividis", "Inferno", "Plasma", "Greys"]
 RSSI_COLOR_SCALE_OPTIONS = ["Turbo", "Viridis", "Cividis", "Inferno", "Plasma", "RdYlGn"]
-
-MAP_OVERLAY_BASE_STYLE = {
-    "position": "absolute",
-    "inset": "0",
-    "display": "none",
-    "alignItems": "center",
-    "justifyContent": "center",
-    "backgroundColor": "rgba(255,255,255,0.45)",
-    "backdropFilter": "blur(1px)",
-    "fontWeight": "600",
-    "fontSize": "18px",
-    "zIndex": 10,
-}
+BASE_MAP_STYLE_OPTIONS = [
+    {"label": "Satellite", "value": "satellite"},
+    {"label": "Street", "value": "street"},
+]
+PATH_GOOD_COLOR = "#1b7f3a"
+PATH_BAD_COLOR = "#c23b22"
+PATH_PREVIEW_COLOR = "#38bdf8"
+ATTENUATION_EVENT_COLOR = "#f97316"
+ATTENUATION_EVENT_EDGE_COLOR = "#7c2d12"
+TERRAIN_BLOCK_COLOR = "#a855f7"
+MAPLIBRE_VERSION = "5.16.0"
+MAPLIBRE_JS_URL = f"https://unpkg.com/maplibre-gl@{MAPLIBRE_VERSION}/dist/maplibre-gl.js"
+MAPLIBRE_CSS_URL = f"https://unpkg.com/maplibre-gl@{MAPLIBRE_VERSION}/dist/maplibre-gl.css"
+MAPLIBRE_GLYPHS_URL = "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf"
+TERRAIN_TILE_SIZE = 256
+TERRAIN_MAX_ZOOM = 15
+DEFAULT_TERRAIN_EXAGGERATION = 1.0
+DEFAULT_3D_PITCH = 60.0
+DEFAULT_3D_BEARING = 20.0
+DEFAULT_MAP_LOADING_MESSAGE = "Updating map..."
+RSSI_MAP_LOADING_MESSAGE = "Performing RSSI and LOS Calculations"
+RSSI_RENDER_MODE_OPTIONS = [
+    {"label": "Show max RSSI", "value": "max-rssi"},
+    {"label": "Color by strongest node", "value": "best-node"},
+]
+SATELLITE_TILE_SOURCE = [
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}"
+]
 
 OFFSETS = {
     10: 8,
@@ -94,6 +120,7 @@ V_ATTENUATION = np.vectorize(lambda value: ATTENUATION.get(int(value), 0), otype
 ANALYSIS_CONTEXT = {}
 ANALYSIS_KEY = None
 RSSI_OVERLAY_CACHE = {}
+TERRAIN_DEM_TOKENS = {}
 
 
 def node_signature(node):
@@ -110,6 +137,32 @@ def node_signature(node):
     )
 
 
+def point_path_signature(point_path_data):
+    if not point_path_data:
+        return "point:none"
+
+    source_node_id = str(point_path_data.get("source_node_id") or "")
+    target_longitude = point_path_data.get("target_longitude")
+    target_latitude = point_path_data.get("target_latitude")
+    if target_longitude is None or target_latitude is None:
+        return f"point:{source_node_id}:invalid"
+    return (
+        f"point:{source_node_id}:"
+        f"{float(target_longitude):.6f}:"
+        f"{float(target_latitude):.6f}"
+    )
+
+
+def native_map_overlay_context_key(nodes, selected_node_ids=None, point_path_data=None):
+    normalized_nodes = [with_node_defaults(node) for node in (nodes or [])]
+    selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in normalized_nodes])
+    parts = ["nodes"]
+    parts.extend(node_signature(node) for node in normalized_nodes)
+    parts.append("selected:" + ",".join(str(node_id) for node_id in selected_node_ids))
+    parts.append(point_path_signature(point_path_data))
+    return "||".join(parts)
+
+
 def fetch_image_href(meta_url):
     response = requests.get(meta_url, timeout=120)
     response.raise_for_status()
@@ -120,18 +173,32 @@ def fetch_image_href(meta_url):
     return href
 
 
-def fetch_binary(url):
-    response = requests.get(url, timeout=240)
+def fetch_binary_with_headers(url, headers=None, timeout=240):
+    response = requests.get(url, timeout=timeout, headers=headers)
     response.raise_for_status()
     return response.content
 
 
 @contextmanager
 def open_remote_raster(url):
-    data = fetch_binary(url)
+    data = fetch_binary_with_headers(url, timeout=240)
     with MemoryFile(data) as memfile:
         with memfile.open() as dataset:
             yield dataset
+
+
+def resolved_raster_transform(dataset, min_x, min_y, max_x, max_y):
+    transform = dataset.transform
+    identity = rasterio.transform.Affine.identity()
+    if transform is None or tuple(transform) == tuple(identity):
+        return rasterio.transform.from_bounds(float(min_x), float(min_y), float(max_x), float(max_y), dataset.width, dataset.height)
+    return transform
+
+
+def safe_reproject(**kwargs):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", NotGeoreferencedWarning)
+        reproject(**kwargs)
 
 
 def worldcover_tile_code(lat_start, lon_start):
@@ -191,6 +258,878 @@ def normalize_bbox(min_lon, min_lat, max_lon, max_lat):
     return tuple(round(value, 6) for value in values)
 
 
+def bbox_dict(bounds):
+    min_lon, min_lat, max_lon, max_lat = normalize_bbox(
+        bounds["min_lon"],
+        bounds["min_lat"],
+        bounds["max_lon"],
+        bounds["max_lat"],
+    )
+    return {
+        "min_lon": min_lon,
+        "min_lat": min_lat,
+        "max_lon": max_lon,
+        "max_lat": max_lat,
+    }
+
+
+def next_revision(current_revision):
+    return int(current_revision or 0) + 1
+
+
+def click_mode_value(click_mode):
+    return str((click_mode or {}).get("mode", "none"))
+
+
+def toggle_click_mode_state(click_mode, target_mode):
+    mode = click_mode_value(click_mode)
+    if mode == str(target_mode):
+        return {"mode": "none", "node_id": None}
+    return {"mode": str(target_mode), "node_id": None}
+
+
+def click_mode_button_copy(click_mode, target_mode, active_label, active_status, inactive_label, inactive_status):
+    if click_mode_value(click_mode) == str(target_mode):
+        return active_label, active_status
+    return inactive_label, inactive_status
+
+
+def fit_bbox_for_nodes(nodes, padding_fraction=0.12, min_padding_deg=0.01):
+    normalized_nodes = [with_node_defaults(node) for node in (nodes or [])]
+    if not normalized_nodes:
+        return None
+
+    longitudes = [float(node["longitude"]) for node in normalized_nodes]
+    latitudes = [float(node["latitude"]) for node in normalized_nodes]
+    min_lon = min(longitudes)
+    max_lon = max(longitudes)
+    min_lat = min(latitudes)
+    max_lat = max(latitudes)
+
+    lon_span = max(max_lon - min_lon, min_padding_deg)
+    lat_span = max(max_lat - min_lat, min_padding_deg)
+    lon_pad = max(lon_span * padding_fraction, min_padding_deg)
+    lat_pad = max(lat_span * padding_fraction, min_padding_deg)
+
+    return {
+        "min_lon": round(min_lon - lon_pad, 6),
+        "min_lat": round(min_lat - lat_pad, 6),
+        "max_lon": round(max_lon + lon_pad, 6),
+        "max_lat": round(max_lat + lat_pad, 6),
+    }
+
+
+def point_in_bbox(longitude, latitude, bbox):
+    if not bbox:
+        return False
+    return (
+        float(bbox["min_lon"]) <= float(longitude) <= float(bbox["max_lon"])
+        and float(bbox["min_lat"]) <= float(latitude) <= float(bbox["max_lat"])
+    )
+
+
+def nodes_outside_loaded_bbox(nodes, bbox):
+    outside = []
+    for node in nodes or []:
+        if not point_in_bbox(node["longitude"], node["latitude"], bbox):
+            outside.append(str(node["name"]))
+    return outside
+
+
+def clip_mercator_lat(latitude):
+    return max(min(float(latitude), 85.05112878), -85.05112878)
+
+
+def lon_to_tile_x(longitude, zoom):
+    return (float(longitude) + 180.0) / 360.0 * (2**zoom)
+
+
+def lat_to_tile_y(latitude, zoom):
+    lat_rad = math.radians(clip_mercator_lat(latitude))
+    return (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * (2**zoom)
+
+
+def choose_osm_zoom(min_lon, min_lat, max_lon, max_lat):
+    for zoom in range(OSM_MAX_ZOOM, OSM_MIN_ZOOM - 1, -1):
+        x0 = int(math.floor(lon_to_tile_x(min_lon, zoom)))
+        x1 = int(math.floor(lon_to_tile_x(max_lon, zoom)))
+        y0 = int(math.floor(lat_to_tile_y(max_lat, zoom)))
+        y1 = int(math.floor(lat_to_tile_y(min_lat, zoom)))
+        x_count = max(1, x1 - x0 + 1)
+        y_count = max(1, y1 - y0 + 1)
+        if x_count * y_count <= OSM_MAX_TILE_COUNT and x_count <= 8 and y_count <= 8:
+            return zoom
+    return OSM_MIN_ZOOM
+
+
+def geographic_bbox_to_pixel_shape(min_lon, min_lat, max_lon, max_lat, max_dim=1600):
+    lon_span = max(float(max_lon) - float(min_lon), 1e-6)
+    lat_span = max(float(max_lat) - float(min_lat), 1e-6)
+    if lon_span >= lat_span:
+        width = max_dim
+        height = max(512, int(round(max_dim * lat_span / lon_span)))
+    else:
+        height = max_dim
+        width = max(512, int(round(max_dim * lon_span / lat_span)))
+    return width, height
+
+
+def raster_layer_coordinates(bbox_data):
+    return [
+        [float(bbox_data["min_lon"]), float(bbox_data["max_lat"])],
+        [float(bbox_data["max_lon"]), float(bbox_data["max_lat"])],
+        [float(bbox_data["max_lon"]), float(bbox_data["min_lat"])],
+        [float(bbox_data["min_lon"]), float(bbox_data["min_lat"])],
+    ]
+
+
+def feature_collection(features=None):
+    return {
+        "type": "FeatureCollection",
+        "features": list(features or []),
+    }
+
+
+def build_maplibre_style(base_map_style):
+    style_name = str(base_map_style or "satellite")
+    if style_name == "satellite":
+        return {
+            "version": 8,
+            "glyphs": MAPLIBRE_GLYPHS_URL,
+            "sources": {
+                "basemap": {
+                    "type": "raster",
+                    "tiles": SATELLITE_TILE_SOURCE,
+                    "tileSize": 256,
+                    "attribution": "United States Geological Survey",
+                    "maxzoom": 18,
+                }
+            },
+            "layers": [{"id": "basemap", "type": "raster", "source": "basemap"}],
+        }
+
+    return {
+        "version": 8,
+        "glyphs": MAPLIBRE_GLYPHS_URL,
+        "sources": {
+            "basemap": {
+                "type": "raster",
+                "tiles": [OSM_TILE_URL],
+                "tileSize": 256,
+                "attribution": "© OpenStreetMap contributors",
+                "maxzoom": 19,
+            }
+        },
+        "layers": [{"id": "basemap", "type": "raster", "source": "basemap"}],
+    }
+
+
+def colorscale_gradient_css(colorscale_name, sample_count=7):
+    colors = sample_colorscale(colorscale_name, np.linspace(0.0, 1.0, sample_count))
+    return "linear-gradient(90deg, " + ", ".join(colors) + ")"
+
+
+def build_gradient_legend_card(title, colorscale_name, minimum, maximum):
+    return html.Div(
+        [
+            html.Div(title, className="native-map-legend-title"),
+            html.Div(
+                className="native-map-legend-gradient",
+                style={"background": colorscale_gradient_css(colorscale_name)},
+            ),
+            html.Div(
+                [
+                    html.Span(f"{float(minimum):.0f}"),
+                    html.Span(f"{float(maximum):.0f}"),
+                ],
+                className="native-map-legend-range",
+            ),
+        ],
+        className="native-map-legend-card",
+    )
+
+
+def build_discrete_legend_card(title, items):
+    return html.Div(
+        [
+            html.Div(title, className="native-map-legend-title"),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Span(
+                                className="native-map-legend-swatch",
+                                style={"backgroundColor": str(item["color"])},
+                            ),
+                            html.Span(str(item["label"])),
+                        ],
+                        className="native-map-legend-item",
+                    )
+                    for item in (items or [])
+                ],
+                className="native-map-legend-list",
+            ),
+        ],
+        className="native-map-legend-card",
+    )
+
+
+def build_native_map_legends(terrain_legend=None, rssi_legend=None):
+    cards = []
+    if terrain_legend is not None:
+        cards.append(
+            build_gradient_legend_card(
+                "Elevation (m)",
+                terrain_legend["colorscale"],
+                terrain_legend["min"],
+                terrain_legend["max"],
+            )
+        )
+    if rssi_legend is not None:
+        if rssi_legend.get("type") == "categorical":
+            cards.append(
+                build_discrete_legend_card(
+                    str(rssi_legend.get("title") or "Best Serving Node"),
+                    rssi_legend.get("items") or [],
+                )
+            )
+        else:
+            cards.append(
+                build_gradient_legend_card(
+                    str(rssi_legend.get("title") or "Max RSSI (dBm)"),
+                    rssi_legend["colorscale"],
+                    rssi_legend["min"],
+                    rssi_legend["max"],
+                )
+            )
+    if not cards:
+        return html.Div()
+    return html.Div(cards, className="native-map-legend-stack")
+
+
+def build_node_feature_collection(nodes, selected_node_ids):
+    normalized_nodes = [with_node_defaults(node) for node in (nodes or [])]
+    selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in normalized_nodes])
+    outline_colors, outline_widths = node_marker_outline_arrays(normalized_nodes, selected_node_ids)
+
+    features = []
+    for index, node in enumerate(normalized_nodes):
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [float(node["longitude"]), float(node["latitude"])],
+                },
+                "properties": {
+                    "kind": "node",
+                    "node_id": str(node["id"]),
+                    "name": str(node["name"]),
+                    "color": node_color(index),
+                    "outline_color": outline_colors[index],
+                    "outline_width": float(outline_widths[index]),
+                },
+            }
+        )
+    return feature_collection(features)
+
+
+def build_loaded_bbox_feature_collection(loaded_bbox):
+    if not loaded_bbox:
+        return feature_collection()
+    return feature_collection(
+        [
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [
+                        [float(loaded_bbox["min_lon"]), float(loaded_bbox["max_lat"])],
+                        [float(loaded_bbox["max_lon"]), float(loaded_bbox["max_lat"])],
+                        [float(loaded_bbox["max_lon"]), float(loaded_bbox["min_lat"])],
+                        [float(loaded_bbox["min_lon"]), float(loaded_bbox["min_lat"])],
+                        [float(loaded_bbox["min_lon"]), float(loaded_bbox["max_lat"])],
+                    ],
+                },
+                "properties": {
+                    "kind": "loaded-bbox",
+                    "color": "#38bdf8",
+                },
+            }
+        ]
+    )
+
+
+def sample_grid_value(values, lon_axis, lat_axis, longitude, latitude):
+    array = np.asarray(values)
+    lon_axis = np.asarray(lon_axis, dtype=np.float64)
+    lat_axis = np.asarray(lat_axis, dtype=np.float64)
+    if array.ndim != 2 or lon_axis.size == 0 or lat_axis.size == 0:
+        return None
+
+    column_index = int(np.abs(lon_axis - float(longitude)).argmin())
+    row_index = int(np.abs(lat_axis - float(latitude)).argmin())
+    sample = float(array[row_index, column_index])
+    if not np.isfinite(sample):
+        return None
+    return sample
+
+
+def build_native_path_line_feature(start_lon, start_lat, end_lon, end_lat, color, dashed=False):
+    return {
+        "type": "Feature",
+        "geometry": {
+            "type": "LineString",
+            "coordinates": [[float(start_lon), float(start_lat)], [float(end_lon), float(end_lat)]],
+        },
+        "properties": {
+            "kind": "path-line",
+            "color": color,
+            "dashed": bool(dashed),
+        },
+    }
+
+
+def empty_native_path_overlay():
+    return {
+        "line": feature_collection(),
+        "attenuation_points": feature_collection(),
+        "terrain_block_points": feature_collection(),
+    }
+
+
+def build_native_path_overlay(start_lon, start_lat, end_lon, end_lat, color, dashed=False, result=None):
+    line = feature_collection(
+        [build_native_path_line_feature(start_lon, start_lat, end_lon, end_lat, color, dashed=dashed)]
+    )
+    if result is None:
+        attenuation_points = feature_collection()
+        terrain_block_points = feature_collection()
+    else:
+        attenuation_points, terrain_block_points = build_native_path_event_feature_collections(
+            result,
+            start_lon,
+            start_lat,
+            end_lon,
+            end_lat,
+        )
+    return {
+        "line": line,
+        "attenuation_points": attenuation_points,
+        "terrain_block_points": terrain_block_points,
+    }
+
+
+def build_path_sample_fractions(result):
+    distance_along = np.asarray(result.get("distance_along_km", []), dtype=np.float64)
+    if distance_along.size:
+        total_distance = float(distance_along[-1])
+        if total_distance > 1e-9:
+            return np.clip(distance_along / total_distance, 0.0, 1.0)
+        if distance_along.size == 1:
+            return np.array([0.0], dtype=np.float64)
+        return np.linspace(0.0, 1.0, distance_along.size, dtype=np.float64)
+
+    path_longitude = np.asarray(result.get("path_longitude", []), dtype=np.float64)
+    if path_longitude.size == 0:
+        return np.array([], dtype=np.float64)
+    if path_longitude.size == 1:
+        return np.array([0.0], dtype=np.float64)
+    return np.linspace(0.0, 1.0, path_longitude.size, dtype=np.float64)
+
+
+def interpolate_path_coordinates(start_lon, start_lat, end_lon, end_lat, fractions):
+    fractions = np.asarray(fractions, dtype=np.float64)
+    if fractions.size == 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    longitude = float(start_lon) + (float(end_lon) - float(start_lon)) * fractions
+    latitude = float(start_lat) + (float(end_lat) - float(start_lat)) * fractions
+    return longitude.astype(np.float64), latitude.astype(np.float64)
+
+
+def build_native_path_event_feature_collections(result, start_lon, start_lat, end_lon, end_lat):
+    path_fraction = build_path_sample_fractions(result)
+    blockage_fraction = np.asarray(result.get("blockage_fraction", []), dtype=np.float64)
+    attenuation_per_sample_db = np.asarray(result.get("attenuation_per_sample_db", []), dtype=np.float64)
+    terrain_only_blocked = np.asarray(result.get("terrain_only_blocked", []), dtype=bool)
+
+    attenuation_features = []
+    terrain_block_features = []
+    if path_fraction.size == 0:
+        return feature_collection(), feature_collection()
+    path_longitude, path_latitude = interpolate_path_coordinates(
+        start_lon,
+        start_lat,
+        end_lon,
+        end_lat,
+        path_fraction,
+    )
+
+    attenuation_mask = (blockage_fraction > 0) & ~terrain_only_blocked
+    for longitude, latitude, blocked_fraction, added_loss_db in zip(
+        path_longitude[attenuation_mask],
+        path_latitude[attenuation_mask],
+        blockage_fraction[attenuation_mask],
+        attenuation_per_sample_db[attenuation_mask],
+        strict=False,
+    ):
+        attenuation_features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [float(longitude), float(latitude)]},
+                "properties": {
+                    "kind": "attenuation-event",
+                    "blocked_fraction": float(blocked_fraction),
+                    "added_loss_db": float(added_loss_db),
+                    "sample_fraction": float(path_fraction[attenuation_mask][len(attenuation_features)]),
+                    "radius": float(np.clip(4.5 + 5.0 * blocked_fraction, 4.5, 9.0)),
+                    "color": ATTENUATION_EVENT_COLOR,
+                },
+            }
+        )
+
+    for longitude, latitude, added_loss_db in zip(
+        path_longitude[terrain_only_blocked],
+        path_latitude[terrain_only_blocked],
+        attenuation_per_sample_db[terrain_only_blocked],
+        strict=False,
+    ):
+        terrain_block_features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [float(longitude), float(latitude)]},
+                "properties": {
+                    "kind": "terrain-los-block",
+                    "added_loss_db": float(added_loss_db),
+                    "sample_fraction": float(path_fraction[terrain_only_blocked][len(terrain_block_features)]),
+                    "radius": 6.5,
+                    "color": TERRAIN_BLOCK_COLOR,
+                },
+            }
+        )
+
+    return feature_collection(attenuation_features), feature_collection(terrain_block_features)
+
+
+def compute_native_map_path_overlay(nodes, selected_node_ids, point_path_data, bundle, global_rx_height_agl, global_rx_gain_dbi):
+    nodes = [with_node_defaults(node) for node in (nodes or [])]
+    selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in nodes])
+    if bundle is not None:
+        ensure_analysis_context(bundle)
+
+    if len(selected_node_ids) == 2:
+        source = find_node(nodes, selected_node_ids[0])
+        target = find_node(nodes, selected_node_ids[1])
+        if source is None or target is None:
+            return empty_native_path_overlay()
+        if bundle is None:
+            return build_native_path_overlay(
+                source["longitude"],
+                source["latitude"],
+                target["longitude"],
+                target["latitude"],
+                PATH_PREVIEW_COLOR,
+            )
+        try:
+            link_result = compute_bidirectional_link_result(source, target)
+        except Exception:
+            return build_native_path_overlay(
+                source["longitude"],
+                source["latitude"],
+                target["longitude"],
+                target["latitude"],
+                PATH_BAD_COLOR,
+                dashed=True,
+            )
+        return build_native_path_overlay(
+            source["longitude"],
+            source["latitude"],
+            target["longitude"],
+            target["latitude"],
+            PATH_GOOD_COLOR if link_result["good_link"] else PATH_BAD_COLOR,
+            dashed=not link_result["good_link"],
+            result=link_result["forward_result"],
+        )
+
+    if point_path_data:
+        source = find_node(nodes, point_path_data.get("source_node_id"))
+        target_lon = point_path_data.get("target_longitude")
+        target_lat = point_path_data.get("target_latitude")
+        if source is None or target_lon is None or target_lat is None:
+            return empty_native_path_overlay()
+        if bundle is None:
+            return build_native_path_overlay(
+                source["longitude"],
+                source["latitude"],
+                float(target_lon),
+                float(target_lat),
+                PATH_PREVIEW_COLOR,
+            )
+        try:
+            result = compute_path_loss(
+                (source["longitude"], source["latitude"]),
+                (float(target_lon), float(target_lat)),
+                tx_height=source["height_agl_m"],
+                rx_height=float(global_rx_height_agl or DEFAULT_NODE_HEIGHT_M),
+                tx_power_dbm=source["tx_power_dbm"],
+                tx_gain_dbi=source["antenna_gain_dbi"],
+                rx_gain_dbi=float(global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI),
+            )
+        except Exception:
+            return build_native_path_overlay(
+                source["longitude"],
+                source["latitude"],
+                float(target_lon),
+                float(target_lat),
+                PATH_BAD_COLOR,
+                dashed=True,
+            )
+        return build_native_path_overlay(
+            source["longitude"],
+            source["latitude"],
+            float(target_lon),
+            float(target_lat),
+            PATH_GOOD_COLOR if result["rssi_dbm"] > MIN_LINK_RSSI_DBM else PATH_BAD_COLOR,
+            dashed=result["rssi_dbm"] <= MIN_LINK_RSSI_DBM,
+            result=result,
+        )
+
+    return empty_native_path_overlay()
+
+
+def build_native_map_spec(
+    bundle,
+    nodes,
+    terrain_alpha,
+    terrain_clip_range=None,
+    elevation_colorscale="Magma",
+    rssi_overlay=None,
+    rssi_colorscale="Turbo",
+    loaded_bbox=None,
+    selected_node_ids=None,
+    base_map_style="satellite",
+    rssi_opacity=0.55,
+    path_overlay=None,
+    overlay_context_key=None,
+):
+    normalized_nodes = [with_node_defaults(node) for node in (nodes or [])]
+    selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in normalized_nodes])
+    path_overlay = path_overlay or empty_native_path_overlay()
+
+    terrain_layer = None
+    terrain_dem = None
+    terrain_legend = None
+    if bundle is not None:
+        terrain_bounds = bundle["terrain_display_bounds"]
+        terrain_display = bundle["terrain_display"]
+        terrain_valid = terrain_display[np.isfinite(terrain_display)]
+        terrain_min = float(np.nanmin(terrain_valid)) if terrain_valid.size else 0.0
+        terrain_max = float(np.nanmax(terrain_valid)) if terrain_valid.size else terrain_min + 1.0
+        if terrain_max <= terrain_min:
+            terrain_max = terrain_min + 1.0
+
+        clip_min = terrain_min
+        clip_max = terrain_max
+        if terrain_clip_range and len(terrain_clip_range) == 2:
+            clip_min = min(max(float(terrain_clip_range[0]), terrain_min), terrain_max)
+            clip_max = min(max(float(terrain_clip_range[1]), clip_min), terrain_max)
+
+        terrain_legend = {
+            "colorscale": elevation_colorscale,
+            "min": clip_min,
+            "max": clip_max,
+        }
+        token = register_terrain_dem_bundle(bundle)
+        terrain_dem = {
+            "token": token,
+            "tiles": [f"/terrain-dem/{token}/{{z}}/{{x}}/{{y}}.png"],
+            "bounds": [
+                float(terrain_bounds["min_lon"]),
+                float(terrain_bounds["min_lat"]),
+                float(terrain_bounds["max_lon"]),
+                float(terrain_bounds["max_lat"]),
+            ],
+            "tile_size": TERRAIN_TILE_SIZE,
+            "maxzoom": TERRAIN_MAX_ZOOM,
+            "encoding": "terrarium",
+            "exaggeration": DEFAULT_TERRAIN_EXAGGERATION,
+            "pitch": DEFAULT_3D_PITCH,
+            "bearing": DEFAULT_3D_BEARING,
+            "color_relief": {
+                "expression": maplibre_color_relief_expression(elevation_colorscale, clip_min, clip_max),
+                "opacity": float(terrain_alpha or 0.0),
+            },
+        }
+
+    rssi_layer = None
+    rssi_legend = None
+    if rssi_overlay is not None:
+        overlay_mode = str(rssi_overlay.get("mode") or "max-rssi")
+        if overlay_mode == "best-node":
+            rssi_uri = colorize_category_array_to_png_uri(
+                np.flipud(rssi_overlay["owner_index"]),
+                [item["color"] for item in rssi_overlay.get("legend_items", [])],
+                alpha=rssi_opacity or 0.0,
+            )
+            rssi_legend = {
+                "type": "categorical",
+                "title": "Best Serving Node",
+                "items": [
+                    {"label": item["label"], "color": item["color"]}
+                    for item in rssi_overlay.get("legend_items", [])
+                ],
+            }
+        else:
+            rssi_uri = colorize_array_to_png_uri(
+                np.flipud(rssi_overlay["max_rssi"]),
+                rssi_colorscale,
+                -140.0,
+                -60.0,
+                alpha=rssi_opacity or 0.0,
+            )
+            rssi_legend = {
+                "type": "gradient",
+                "title": "Max RSSI (dBm)",
+                "colorscale": rssi_colorscale,
+                "min": -140.0,
+                "max": -60.0,
+            }
+        if rssi_uri is not None and bundle is not None and float(rssi_opacity or 0.0) > 0.0:
+            rssi_layer = {
+                "image": rssi_uri,
+                "coordinates": raster_layer_coordinates(bundle["terrain_display_bounds"]),
+                "opacity": 1.0,
+            }
+
+    return {
+        "base_style_key": str(base_map_style or "satellite"),
+        "base_style": build_maplibre_style(base_map_style),
+        "terrain_dem": terrain_dem,
+        "terrain_layer": terrain_layer,
+        "rssi_layer": rssi_layer,
+        "nodes": build_node_feature_collection(normalized_nodes, selected_node_ids),
+        "loaded_bbox": build_loaded_bbox_feature_collection(bundle["terrain_display_bounds"] if bundle is not None else loaded_bbox),
+        "path_line": path_overlay.get("line", feature_collection()),
+        "attenuation_points": path_overlay.get("attenuation_points", feature_collection()),
+        "terrain_block_points": path_overlay.get("terrain_block_points", feature_collection()),
+        "terrain_legend": terrain_legend,
+        "rssi_legend": rssi_legend,
+        "overlay_context_key": str(overlay_context_key or ""),
+    }
+
+
+def colorize_array_to_png_uri(values, colorscale_name, zmin, zmax, alpha=1.0):
+    finite_mask = np.isfinite(values)
+    if not np.any(finite_mask):
+        return None
+
+    scale_range = max(float(zmax) - float(zmin), 1e-9)
+    normalized = np.zeros(values.shape, dtype=np.float32)
+    normalized[finite_mask] = np.clip((values[finite_mask] - float(zmin)) / scale_range, 0.0, 1.0)
+    lut = np.array(
+        [ImageColor.getcolor(color, "RGBA") for color in sample_colorscale(colorscale_name, np.linspace(0.0, 1.0, 256))],
+        dtype=np.uint8,
+    )
+    rgba = np.zeros(values.shape + (4,), dtype=np.uint8)
+    lut_index = np.zeros(values.shape, dtype=np.uint8)
+    lut_index[finite_mask] = np.rint(normalized[finite_mask] * 255.0).astype(np.uint8)
+    rgba[finite_mask] = lut[lut_index[finite_mask]]
+    alpha_value = int(round(np.clip(float(alpha), 0.0, 1.0) * 255.0))
+    rgba[..., 3] = np.where(finite_mask, alpha_value, 0).astype(np.uint8)
+
+    image = Image.fromarray(rgba, mode="RGBA")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def colorize_category_array_to_png_uri(values, colors, alpha=1.0):
+    category_array = np.asarray(values)
+    if category_array.ndim != 2 or not colors:
+        return None
+
+    alpha_value = int(round(np.clip(float(alpha), 0.0, 1.0) * 255.0))
+    if alpha_value <= 0:
+        return None
+
+    valid_mask = np.isfinite(category_array) & (category_array >= 0)
+    if not np.any(valid_mask):
+        return None
+
+    rgba = np.zeros(category_array.shape + (4,), dtype=np.uint8)
+    palette = np.array([ImageColor.getcolor(str(color), "RGBA") for color in colors], dtype=np.uint8)
+    safe_category_array = np.where(valid_mask, category_array, 0).astype(np.int32)
+    clipped_index = np.clip(safe_category_array, 0, len(palette) - 1)
+    rgba[valid_mask] = palette[clipped_index[valid_mask]]
+    rgba[..., 3] = np.where(valid_mask, alpha_value, 0).astype(np.uint8)
+
+    image = Image.fromarray(rgba, mode="RGBA")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def maplibre_color_relief_expression(colorscale_name, zmin, zmax, sample_count=16):
+    lower = float(zmin)
+    upper = max(float(zmax), lower + 1e-6)
+    stops = np.linspace(lower, upper, sample_count)
+    colors = sample_colorscale(colorscale_name, np.linspace(0.0, 1.0, sample_count))
+    expression = ["interpolate", ["linear"], ["elevation"]]
+    for stop, color in zip(stops, colors, strict=False):
+        expression.extend([float(stop), color])
+    return expression
+
+
+def terrain_dem_token(cache_key):
+    return hashlib.sha1(repr(tuple(cache_key)).encode("utf-8")).hexdigest()[:16]
+
+
+def register_terrain_dem_bundle(bundle):
+    cache_key = tuple(bundle["cache_key"])
+    token = terrain_dem_token(cache_key)
+    TERRAIN_DEM_TOKENS[token] = cache_key
+    return token
+
+
+def tile_lon_lat_bounds(x, y, z):
+    tile_count = 2**int(z)
+    west = float(x) / tile_count * 360.0 - 180.0
+    east = float(x + 1) / tile_count * 360.0 - 180.0
+    north = math.degrees(math.atan(math.sinh(math.pi * (1.0 - (2.0 * float(y)) / tile_count))))
+    south = math.degrees(math.atan(math.sinh(math.pi * (1.0 - (2.0 * float(y + 1)) / tile_count))))
+    return west, south, east, north
+
+
+def terrain_tile_intersects_bbox(tile_bbox, terrain_bbox):
+    west, south, east, north = tile_bbox
+    return not (
+        east <= float(terrain_bbox["min_lon"])
+        or west >= float(terrain_bbox["max_lon"])
+        or north <= float(terrain_bbox["min_lat"])
+        or south >= float(terrain_bbox["max_lat"])
+    )
+
+
+def encode_terrarium_rgb(elevations):
+    values = np.asarray(elevations, dtype=np.float32)
+    safe_values = np.where(np.isfinite(values), values, 0.0) + 32768.0
+    red = np.floor(safe_values / 256.0)
+    green = np.floor(safe_values - red * 256.0)
+    blue = np.floor((safe_values - np.floor(safe_values)) * 256.0)
+    stacked = np.stack(
+        [
+            np.clip(red, 0, 255).astype(np.uint8),
+            np.clip(green, 0, 255).astype(np.uint8),
+            np.clip(blue, 0, 255).astype(np.uint8),
+        ],
+        axis=-1,
+    )
+    return stacked
+
+
+@lru_cache(maxsize=2048)
+def build_terrain_dem_tile_png(token, z, x, y):
+    cache_key = TERRAIN_DEM_TOKENS.get(str(token))
+    if cache_key is None:
+        raise KeyError(f"Unknown terrain DEM token: {token}")
+
+    bundle = get_map_bundle(*cache_key)
+    terrain_display = np.asarray(bundle["terrain_display"], dtype=np.float32)
+    finite = terrain_display[np.isfinite(terrain_display)]
+    fill_value = float(np.nanmin(finite)) if finite.size else 0.0
+
+    tile_bbox = tile_lon_lat_bounds(int(x), int(y), int(z))
+    if not terrain_tile_intersects_bbox(tile_bbox, bundle["terrain_display_bounds"]):
+        rgb = encode_terrarium_rgb(np.full((TERRAIN_TILE_SIZE, TERRAIN_TILE_SIZE), fill_value, dtype=np.float32))
+        image = Image.fromarray(rgb, mode="RGB")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    west, south, east, north = tile_bbox
+    mercator_bounds = transform_bounds(GEOGRAPHIC_CRS, WEB_MERCATOR_CRS, west, south, east, north)
+    destination = np.full((TERRAIN_TILE_SIZE, TERRAIN_TILE_SIZE), np.nan, dtype=np.float32)
+    safe_reproject(
+        source=terrain_display,
+        destination=destination,
+        src_transform=bundle["terrain_display_transform"],
+        src_crs=GEOGRAPHIC_CRS,
+        src_nodata=np.nan,
+        dst_transform=rasterio.transform.from_bounds(*mercator_bounds, TERRAIN_TILE_SIZE, TERRAIN_TILE_SIZE),
+        dst_crs=WEB_MERCATOR_CRS,
+        dst_nodata=np.nan,
+        resampling=Resampling.bilinear,
+    )
+    destination = np.where(np.isfinite(destination), destination, fill_value)
+    rgb = encode_terrarium_rgb(destination)
+    image = Image.fromarray(rgb, mode="RGB")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+@lru_cache(maxsize=512)
+def fetch_osm_tile(z, x, y):
+    tile_count = 2**z
+    wrapped_x = int(x) % tile_count
+    clipped_y = max(0, min(int(y), tile_count - 1))
+    tile_url = OSM_TILE_URL.format(z=z, x=wrapped_x, y=clipped_y)
+    data = fetch_binary_with_headers(tile_url, headers=OSM_TILE_HEADERS, timeout=120)
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+@lru_cache(maxsize=64)
+def get_osm_background_image(min_lon, min_lat, max_lon, max_lat):
+    min_lon, min_lat, max_lon, max_lat = normalize_bbox(min_lon, min_lat, max_lon, max_lat)
+    zoom = choose_osm_zoom(min_lon, min_lat, max_lon, max_lat)
+
+    x0f = lon_to_tile_x(min_lon, zoom)
+    x1f = lon_to_tile_x(max_lon, zoom)
+    y0f = lat_to_tile_y(max_lat, zoom)
+    y1f = lat_to_tile_y(min_lat, zoom)
+
+    x0 = int(math.floor(x0f))
+    x1 = int(math.floor(x1f))
+    y0 = int(math.floor(y0f))
+    y1 = int(math.floor(y1f))
+
+    stitched = Image.new("RGB", ((x1 - x0 + 1) * OSM_TILE_SIZE, (y1 - y0 + 1) * OSM_TILE_SIZE))
+    for tile_x in range(x0, x1 + 1):
+        for tile_y in range(y0, y1 + 1):
+            tile = fetch_osm_tile(zoom, tile_x, tile_y)
+            stitched.paste(tile, ((tile_x - x0) * OSM_TILE_SIZE, (tile_y - y0) * OSM_TILE_SIZE))
+
+    left = int(math.floor((x0f - x0) * OSM_TILE_SIZE))
+    upper = int(math.floor((y0f - y0) * OSM_TILE_SIZE))
+    right = int(math.ceil((x1f - x0) * OSM_TILE_SIZE))
+    lower = int(math.ceil((y1f - y0) * OSM_TILE_SIZE))
+    cropped = stitched.crop((left, upper, max(left + 1, right), max(upper + 1, lower)))
+
+    src_width, src_height = cropped.size
+    src_transform = rasterio.transform.from_bounds(
+        *transform_bounds(GEOGRAPHIC_CRS, WEB_MERCATOR_CRS, min_lon, min_lat, max_lon, max_lat),
+        src_width,
+        src_height,
+    )
+    dst_width, dst_height = geographic_bbox_to_pixel_shape(min_lon, min_lat, max_lon, max_lat)
+    dst_transform = rasterio.transform.from_bounds(min_lon, min_lat, max_lon, max_lat, dst_width, dst_height)
+    source = np.asarray(cropped, dtype=np.uint8).transpose(2, 0, 1)
+    destination = np.zeros((3, dst_height, dst_width), dtype=np.uint8)
+
+    for band_index in range(3):
+        safe_reproject(
+            source=source[band_index],
+            destination=destination[band_index],
+            src_transform=src_transform,
+            src_crs=WEB_MERCATOR_CRS,
+            dst_transform=dst_transform,
+            dst_crs=GEOGRAPHIC_CRS,
+            resampling=Resampling.bilinear,
+        )
+
+    return Image.fromarray(destination.transpose(1, 2, 0))
+
+
 def ranges_from_relayout_data(relayout_data, fallback_x_range, fallback_y_range):
     if not relayout_data:
         return tuple(fallback_x_range), tuple(fallback_y_range)
@@ -246,19 +1185,6 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
     )
     display_terrain_href = fetch_image_href(display_terrain_meta_url)
 
-    imagery_meta_url = (
-        "https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer/exportImage"
-        f"?bbox={min_lon},{min_lat},{max_lon},{max_lat}"
-        f"&bboxSR={GEOGRAPHIC_CRS.split(':')[-1]}"
-        f"&imageSR={GEOGRAPHIC_CRS.split(':')[-1]}"
-        f"&size={DISPLAY_WIDTH},{DISPLAY_HEIGHT}"
-        "&format=tiff"
-        "&pixelType=U8"
-        "&interpolation=RSP_BilinearInterpolation"
-        "&f=json"
-    )
-    imagery_href = fetch_image_href(imagery_meta_url)
-
     projected_terrain_meta_url = (
         "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
         f"?bbox={min_x},{min_y},{max_x},{max_y}"
@@ -272,29 +1198,32 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
     )
     projected_terrain_href = fetch_image_href(projected_terrain_meta_url)
 
-    with open_remote_raster(imagery_href) as src:
-        rgb = src.read([1, 2, 3]).transpose(1, 2, 0).astype(np.uint8)
-        lon_axis, lat_axis = raster_axes(src.transform, src.height, src.width)
-
     with open_remote_raster(display_terrain_href) as src:
         terrain_display = src.read(1).astype(np.float32)
-        terrain_display_lon_axis, terrain_display_lat_axis = raster_axes(src.transform, src.height, src.width)
-        terrain_display_transform = src.transform
+        terrain_display_transform = resolved_raster_transform(src, min_lon, min_lat, max_lon, max_lat)
+        terrain_display_lon_axis, terrain_display_lat_axis = raster_axes(terrain_display_transform, src.height, src.width)
         terrain_display_shape = (src.height, src.width)
+        terrain_display_bounds = {
+            "min_lon": float(min_lon if tuple(src.transform) == tuple(rasterio.transform.Affine.identity()) else src.bounds.left),
+            "min_lat": float(min_lat if tuple(src.transform) == tuple(rasterio.transform.Affine.identity()) else src.bounds.bottom),
+            "max_lon": float(max_lon if tuple(src.transform) == tuple(rasterio.transform.Affine.identity()) else src.bounds.right),
+            "max_lat": float(max_lat if tuple(src.transform) == tuple(rasterio.transform.Affine.identity()) else src.bounds.top),
+        }
 
     with open_remote_raster(projected_terrain_href) as src:
         terrain_band = src.read(1).astype(np.float32)
-        projected_transform = src.transform
+        projected_transform = resolved_raster_transform(src, min_x, min_y, max_x, max_y)
         projected_shape = (src.height, src.width)
         terrain_x_axis, terrain_y_axis = raster_axes(projected_transform, src.height, src.width)
 
     worldcover_band = np.zeros_like(terrain_band, dtype=np.uint8)
     for worldcover_url in worldcover_tile_urls(min_lon, min_lat, max_lon, max_lat):
         with open_remote_raster(worldcover_url) as src:
-            reproject(
-                source=rasterio.band(src, 1),
+            source_band = src.read(1)
+            safe_reproject(
+                source=source_band,
                 destination=worldcover_band,
-                src_transform=src.transform,
+                src_transform=resolved_raster_transform(src, float(src.bounds.left), float(src.bounds.bottom), float(src.bounds.right), float(src.bounds.top)),
                 src_crs=src.crs,
                 src_nodata=0,
                 dst_transform=projected_transform,
@@ -326,14 +1255,12 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
             "max_lon": max_lon,
             "max_lat": max_lat,
         },
-        "rgb": rgb,
-        "lon_axis": lon_axis.astype(np.float64),
-        "lat_axis": lat_axis.astype(np.float64),
         "terrain_display": terrain_display,
         "terrain_display_lon_axis": terrain_display_lon_axis.astype(np.float64),
         "terrain_display_lat_axis": terrain_display_lat_axis.astype(np.float64),
         "terrain_display_transform": terrain_display_transform,
         "terrain_display_shape": terrain_display_shape,
+        "terrain_display_bounds": terrain_display_bounds,
         "terrain_projected": terrain_projected,
         "worldcover_projected": worldcover_projected,
         "projected_transform": projected_transform,
@@ -730,34 +1657,6 @@ def normalize_selected_node_ids(selected_node_ids, valid_ids=None):
     return normalized[-2:]
 
 
-def toggle_selected_node(selected_node_ids, node_id, valid_ids=None):
-    node_id = str(node_id)
-    valid_set = {str(value) for value in valid_ids} if valid_ids is not None else None
-    if valid_set is not None and node_id not in valid_set:
-        return normalize_selected_node_ids(selected_node_ids, valid_ids)
-
-    selected = normalize_selected_node_ids(selected_node_ids, valid_ids)
-    if node_id in selected:
-        selected = [value for value in selected if value != node_id]
-    else:
-        selected.append(node_id)
-    return normalize_selected_node_ids(selected, valid_ids)
-
-
-def clicked_node_id_from_click_data(click_data):
-    if not click_data:
-        return None
-    for point in click_data.get("points", []):
-        custom = point.get("customdata")
-        if isinstance(custom, np.ndarray):
-            if custom.ndim == 0:
-                continue
-            custom = custom.tolist()
-        if isinstance(custom, (list, tuple)) and len(custom) >= 3 and custom[0] == "node":
-            return str(custom[2])
-    return None
-
-
 def select_primary_node(selected_node_ids, node_id):
     selected = normalize_selected_node_ids(selected_node_ids)
     previous_primary = selected[-1] if selected else None
@@ -1006,7 +1905,7 @@ def compute_rssi_overlay(nodes, bundle, include_ground_loss, global_rx_height_ag
         max_rssi = np.fmax(max_rssi, observer_rssi.astype(np.float32))
 
     display_rssi = np.full(bundle["terrain_display_shape"], np.nan, dtype=np.float32)
-    reproject(
+    safe_reproject(
         source=max_rssi,
         destination=display_rssi,
         src_transform=bundle["projected_transform"],
@@ -1081,7 +1980,7 @@ def compute_single_node_rssi_overlay(node, bundle, include_ground_loss, global_r
     observer_rssi = np.where(observer_rssi >= MIN_LINK_RSSI_DBM, observer_rssi, np.nan)
 
     display_rssi = np.full(bundle["terrain_display_shape"], np.nan, dtype=np.float32)
-    reproject(
+    safe_reproject(
         source=observer_rssi.astype(np.float32),
         destination=display_rssi,
         src_transform=bundle["projected_transform"],
@@ -1108,10 +2007,11 @@ def compose_cached_rssi_overlay(bundle, calculation_store, overlay_selection_sto
         return None
 
     node_keys = calculation_store.get("node_overlay_keys", {})
+    selection_store = dict(overlay_selection_store or {})
     enabled_nodes = {
         str(node_id)
-        for node_id, enabled in (overlay_selection_store or {}).items()
-        if bool(enabled) and str(node_id) in node_keys
+        for node_id in calculation_store.get("node_order", [])
+        if str(node_id) in node_keys and bool(selection_store.get(str(node_id), True))
     }
     if not enabled_nodes:
         return None
@@ -1140,7 +2040,147 @@ def compose_cached_rssi_overlay(bundle, calculation_store, overlay_selection_sto
         "max_rssi": combined,
         "lon_axis": lon_axis,
         "lat_axis": lat_axis,
+        "mode": "max-rssi",
     }
+
+
+def get_enabled_rssi_overlay_entries(bundle, nodes, calculation_store, overlay_selection_store):
+    if not bundle or not calculation_store:
+        return []
+    if tuple(calculation_store.get("bundle_key", ())) != bundle["cache_key"]:
+        return []
+
+    normalized_node_list = [with_node_defaults(node) for node in (nodes or [])]
+    normalized_nodes = {
+        str(node["id"]): node
+        for node in normalized_node_list
+    }
+    node_styles = {
+        str(node["id"]): {
+            "label": str(node["name"]),
+            "color": node_color(index),
+        }
+        for index, node in enumerate(normalized_node_list)
+    }
+    node_keys = calculation_store.get("node_overlay_keys", {})
+    node_signatures = calculation_store.get("node_signatures", {})
+    selection_store = dict(overlay_selection_store or {})
+    enabled_node_ids = [
+        str(node_id)
+        for node_id in calculation_store.get("node_order", [])
+        if str(node_id) in node_keys and bool(selection_store.get(str(node_id), True))
+    ]
+    if not enabled_node_ids:
+        return []
+
+    include_ground_loss = bool(calculation_store.get("include_ground_loss", False))
+    rx_height = float(calculation_store.get("global_rx_height_agl", DEFAULT_NODE_HEIGHT_M))
+    rx_gain = float(calculation_store.get("global_rx_gain_dbi", DEFAULT_RX_GAIN_DBI))
+
+    for node_id in enabled_node_ids:
+        expected_key = node_keys.get(node_id)
+        if expected_key in RSSI_OVERLAY_CACHE:
+            continue
+        node = normalized_nodes.get(node_id)
+        if node is None:
+            continue
+        if node_signatures and node_signatures.get(node_id) != node_signature(node):
+            continue
+        cache_key, _overlay = compute_single_node_rssi_overlay(
+            node,
+            bundle,
+            include_ground_loss,
+            rx_height,
+            rx_gain,
+        )
+        if expected_key and cache_key != expected_key:
+            continue
+
+    entries = []
+    for node_id in enabled_node_ids:
+        overlay = RSSI_OVERLAY_CACHE.get(node_keys.get(node_id))
+        if overlay is None:
+            continue
+        style = node_styles.get(node_id, {"label": node_id, "color": node_color(len(entries))})
+        entries.append(
+            {
+                "node_id": node_id,
+                "label": style["label"],
+                "color": style["color"],
+                "overlay": overlay,
+            }
+        )
+    return entries
+
+
+def build_max_rssi_overlay(entries):
+    if not entries:
+        return None
+
+    combined = np.array(entries[0]["overlay"]["max_rssi"], copy=True)
+    lon_axis = entries[0]["overlay"]["lon_axis"]
+    lat_axis = entries[0]["overlay"]["lat_axis"]
+    for entry in entries[1:]:
+        combined = np.fmax(combined, entry["overlay"]["max_rssi"])
+
+    return {
+        "max_rssi": combined,
+        "lon_axis": lon_axis,
+        "lat_axis": lat_axis,
+        "mode": "max-rssi",
+    }
+
+
+def build_best_node_rssi_overlay(entries):
+    if not entries:
+        return None
+
+    template = np.asarray(entries[0]["overlay"]["max_rssi"], dtype=np.float32)
+    best_rssi = np.full(template.shape, -np.inf, dtype=np.float32)
+    owner_index = np.full(template.shape, -1, dtype=np.int16)
+
+    for entry_index, entry in enumerate(entries):
+        values = np.asarray(entry["overlay"]["max_rssi"], dtype=np.float32)
+        valid = np.isfinite(values)
+        replace = valid & ((owner_index < 0) | (values > best_rssi))
+        best_rssi[replace] = values[replace]
+        owner_index[replace] = entry_index
+
+    if not np.any(owner_index >= 0):
+        return None
+
+    return {
+        "mode": "best-node",
+        "max_rssi": np.where(owner_index >= 0, best_rssi, np.nan),
+        "owner_index": owner_index,
+        "lon_axis": entries[0]["overlay"]["lon_axis"],
+        "lat_axis": entries[0]["overlay"]["lat_axis"],
+        "legend_items": [
+            {
+                "node_id": entry["node_id"],
+                "label": entry["label"],
+                "color": entry["color"],
+            }
+            for entry in entries
+        ],
+    }
+
+
+def resolve_rssi_overlay(bundle, nodes, calculation_store, overlay_selection_store):
+    if not bundle or not calculation_store:
+        return None
+
+    overlay = compose_cached_rssi_overlay(bundle, calculation_store, overlay_selection_store)
+    if overlay is not None:
+        return overlay
+
+    entries = get_enabled_rssi_overlay_entries(bundle, nodes, calculation_store, overlay_selection_store)
+    return build_max_rssi_overlay(entries)
+
+
+def resolve_rssi_provider_overlay(bundle, nodes, calculation_store, overlay_selection_store):
+    entries = get_enabled_rssi_overlay_entries(bundle, nodes, calculation_store, overlay_selection_store)
+    return build_best_node_rssi_overlay(entries)
 
 
 def overlay_cache_key(bundle, nodes, include_ground_loss, global_rx_height_agl_m, global_rx_gain_dbi):
@@ -1165,360 +2205,6 @@ def overlay_cache_key(bundle, nodes, include_ground_loss, global_rx_height_agl_m
             )
         )
     return "::".join(parts)
-
-
-def bounds_from_axes(x_axis, y_axis):
-    x_step = abs(float(x_axis[1] - x_axis[0])) if len(x_axis) > 1 else 0.0
-    y_step = abs(float(y_axis[1] - y_axis[0])) if len(y_axis) > 1 else 0.0
-    x_min = float(np.min(x_axis) - x_step / 2)
-    x_max = float(np.max(x_axis) + x_step / 2)
-    y_min = float(np.min(y_axis) - y_step / 2)
-    y_max = float(np.max(y_axis) + y_step / 2)
-    return x_min, x_max, y_min, y_max
-
-
-def build_map_figure(
-    bundle,
-    nodes,
-    terrain_alpha,
-    terrain_clip_range=None,
-    elevation_colorscale="Magma",
-    rssi_overlay=None,
-    rssi_colorscale="Turbo",
-    shapes=None,
-    path_traces=None,
-    rssi_opacity=0.55,
-    selected_node_ids=None,
-):
-    lon_min, lon_max, lat_min, lat_max = bounds_from_axes(bundle["lon_axis"], bundle["lat_axis"])
-    terrain_lon = bundle["terrain_display_lon_axis"]
-    terrain_lat = bundle["terrain_display_lat_axis"][::-1]
-    terrain_display = np.flipud(bundle["terrain_display"])
-    terrain_valid = terrain_display[np.isfinite(terrain_display)]
-    terrain_min = float(np.nanmin(terrain_valid)) if terrain_valid.size else 0.0
-    terrain_max = float(np.nanmax(terrain_valid)) if terrain_valid.size else terrain_min + 1.0
-    if terrain_max <= terrain_min:
-        terrain_max = terrain_min + 1.0
-
-    normalized_nodes = [with_node_defaults(node) for node in (nodes or [])]
-    selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in normalized_nodes])
-
-    clip_min = terrain_min
-    clip_max = terrain_max
-    if terrain_clip_range and len(terrain_clip_range) == 2:
-        clip_min = min(max(float(terrain_clip_range[0]), terrain_min), terrain_max)
-        clip_max = min(max(float(terrain_clip_range[1]), clip_min), terrain_max)
-
-    terrain_clipped = np.clip(terrain_display, clip_min, clip_max)
-
-    fig = go.Figure()
-
-    fig.add_layout_image(
-        dict(
-            source=Image.fromarray(bundle["rgb"]),
-            xref="x",
-            yref="y",
-            x=lon_min,
-            y=lat_max,
-            sizex=lon_max - lon_min,
-            sizey=lat_max - lat_min,
-            sizing="stretch",
-            layer="below",
-        )
-    )
-
-    fig.add_trace(
-        go.Heatmap(
-            z=terrain_clipped,
-            x=terrain_lon,
-            y=terrain_lat,
-            customdata=terrain_display,
-            colorscale=elevation_colorscale,
-            opacity=max(float(terrain_alpha), 0.001),
-            zmin=clip_min,
-            zmax=clip_max,
-            colorbar={"title": "Elevation (m)", "x": -0.14, "y": 0.5, "len": 0.84},
-            showscale=terrain_alpha > 0,
-            zsmooth=False,
-            hovertemplate=(
-                "Longitude=%{x:.4f}<br>"
-                "Latitude=%{y:.4f}<br>"
-                "Elevation=%{customdata:.1f} m<extra></extra>"
-            ),
-            name="terrain",
-        )
-    )
-
-    if rssi_overlay is not None:
-        fig.add_trace(
-            go.Heatmap(
-                z=rssi_overlay["max_rssi"],
-                x=rssi_overlay["lon_axis"],
-                y=rssi_overlay["lat_axis"],
-                colorscale=rssi_colorscale,
-                opacity=max(float(rssi_opacity), 0.001),
-                zsmooth=False,
-                zmin=-140,
-                zmax=-60,
-                colorbar={"title": "Max RSSI (dBm)", "x": 1.08, "y": 0.5, "len": 0.84},
-                hovertemplate=(
-                    "Longitude=%{x:.4f}<br>"
-                    "Latitude=%{y:.4f}<br>"
-                    "Max RSSI=%{z:.1f} dBm<extra></extra>"
-                ),
-                name="max-rssi",
-            )
-        )
-
-    for trace in path_traces or []:
-        fig.add_trace(trace)
-
-    if normalized_nodes:
-        node_colors = [node_color(index) for index, _node in enumerate(normalized_nodes)]
-        node_customdata = [["node", node["name"], str(node["id"])] for node in normalized_nodes]
-        line_colors, line_widths = node_marker_outline_arrays(normalized_nodes, selected_node_ids)
-        fig.add_trace(
-            go.Scatter(
-                x=[node["longitude"] for node in normalized_nodes],
-                y=[node["latitude"] for node in normalized_nodes],
-                mode="markers",
-                marker={
-                    "size": 12,
-                    "color": node_colors,
-                    "line": {"color": line_colors, "width": line_widths},
-                    "opacity": 1,
-                },
-                selected={"marker": {"opacity": 1}},
-                unselected={"marker": {"opacity": 1}},
-                customdata=node_customdata,
-                hovertemplate="<b>%{customdata[1]}</b><br>Longitude=%{x:.5f}<br>Latitude=%{y:.5f}<extra></extra>",
-                showlegend=False,
-                name="nodes",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[node["longitude"] for node in normalized_nodes],
-                y=[node["latitude"] for node in normalized_nodes],
-                mode="markers",
-                marker={
-                    "size": 26,
-                    "color": "rgba(255,255,255,0.001)",
-                    "line": {"color": "rgba(255,255,255,0)", "width": 0},
-                },
-                customdata=node_customdata,
-                hoverinfo="skip",
-                showlegend=False,
-                name="node-hitbox",
-            )
-        )
-        for index, node in enumerate(normalized_nodes):
-            fig.add_annotation(
-                x=node["longitude"],
-                y=node["latitude"],
-                text=node["name"],
-                showarrow=False,
-                yshift=16,
-                bgcolor="rgba(17,24,39,0.92)",
-                bordercolor=node_color(index),
-                borderpad=3,
-                font={"size": 11, "color": "#f9fafb", "family": "Open Sans, sans-serif"},
-            )
-
-    fig.update_layout(
-        height=720,
-        shapes=shapes or [],
-        margin={
-            "l": 120 if terrain_alpha > 0 else 20,
-            "r": 120 if rssi_overlay is not None else 70,
-            "t": 10,
-            "b": 10,
-        },
-        paper_bgcolor="#111827",
-        plot_bgcolor="#111827",
-        font={"family": "Open Sans, sans-serif", "color": "#e5e7eb"},
-        clickmode="event",
-        dragmode="pan",
-        uirevision=f"{bundle['cache_key']}-map-{len(nodes or [])}",
-    )
-    fig.update_xaxes(
-        title="Longitude",
-        tickformat=".4f",
-        range=[lon_min, lon_max],
-        showgrid=False,
-        zeroline=False,
-        constrain="domain",
-        color="#e5e7eb",
-    )
-    fig.update_yaxes(
-        title="Latitude",
-        tickformat=".4f",
-        range=[lat_min, lat_max],
-        showgrid=False,
-        zeroline=False,
-        scaleanchor="x",
-        scaleratio=1,
-        constrain="domain",
-        color="#e5e7eb",
-    )
-    return fig
-
-
-def build_map_path_event_traces(result):
-    path_longitude = np.asarray(result.get("path_longitude", []), dtype=np.float64)
-    path_latitude = np.asarray(result.get("path_latitude", []), dtype=np.float64)
-    blockage_fraction = np.asarray(result.get("blockage_fraction", []), dtype=np.float64)
-    attenuation_per_sample_db = np.asarray(result.get("attenuation_per_sample_db", []), dtype=np.float64)
-    terrain_only_blocked = np.asarray(result.get("terrain_only_blocked", []), dtype=bool)
-
-    traces = []
-    if path_longitude.size == 0 or path_latitude.size == 0:
-        return traces
-
-    attenuation_mask = (blockage_fraction > 0) & ~terrain_only_blocked
-    if np.any(attenuation_mask):
-        attenuation_customdata = np.column_stack(
-            (
-                blockage_fraction[attenuation_mask],
-                attenuation_per_sample_db[attenuation_mask],
-            )
-        )
-        traces.append(
-            go.Scatter(
-                x=path_longitude[attenuation_mask],
-                y=path_latitude[attenuation_mask],
-                mode="markers",
-                marker={
-                    "size": np.clip(8 + 10 * blockage_fraction[attenuation_mask], 8, 18),
-                    "color": "#f97316",
-                    "opacity": 0.88,
-                    "line": {"color": "#7c2d12", "width": 1.0},
-                    "symbol": "circle",
-                },
-                customdata=attenuation_customdata,
-                hovertemplate=(
-                    "Attenuation event<br>"
-                    "Longitude=%{x:.5f}<br>"
-                    "Latitude=%{y:.5f}<br>"
-                    "Blocked fraction=%{customdata[0]:.2f}<br>"
-                    "Added loss=%{customdata[1]:.2f} dB<extra></extra>"
-                ),
-                showlegend=False,
-                name="attenuation-events",
-            )
-        )
-
-    if np.any(terrain_only_blocked):
-        terrain_customdata = attenuation_per_sample_db[terrain_only_blocked][:, None]
-        traces.append(
-            go.Scatter(
-                x=path_longitude[terrain_only_blocked],
-                y=path_latitude[terrain_only_blocked],
-                mode="markers",
-                marker={
-                    "size": 11,
-                    "color": "#a855f7",
-                    "opacity": 0.95,
-                    "line": {"color": "#f5d0fe", "width": 1.2},
-                    "symbol": "diamond",
-                },
-                customdata=terrain_customdata,
-                hovertemplate=(
-                    "Terrain LOS block<br>"
-                    "Longitude=%{x:.5f}<br>"
-                    "Latitude=%{y:.5f}<br>"
-                    "Added loss=%{customdata[0]:.2f} dB<extra></extra>"
-                ),
-                showlegend=False,
-                name="terrain-los-blocks",
-            )
-        )
-
-    return traces
-
-
-def compute_map_path_overlay(nodes, selected_node_ids, point_path_data, bbox_data, global_rx_height_agl, global_rx_gain_dbi):
-    nodes = [with_node_defaults(node) for node in (nodes or [])]
-    selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in nodes])
-
-    def line_shape(x0, y0, x1, y1, good_link):
-        return {
-            "type": "line",
-            "xref": "x",
-            "yref": "y",
-            "x0": x0,
-            "y0": y0,
-            "x1": x1,
-            "y1": y1,
-            "line": {
-                "color": "#1b7f3a" if good_link else "#c23b22",
-                "width": 4,
-                "dash": "solid" if good_link else "dash",
-            },
-        }
-
-    def overlay_from_result(result, x0, y0, x1, y1, good_link):
-        return {
-            "shapes": [line_shape(x0, y0, x1, y1, good_link)],
-            "traces": build_map_path_event_traces(result),
-        }
-
-    if len(selected_node_ids) == 2:
-        bbox = normalize_bbox(
-            bbox_data["min_lon"],
-            bbox_data["min_lat"],
-            bbox_data["max_lon"],
-            bbox_data["max_lat"],
-        )
-        bundle = get_map_bundle(*bbox)
-        ensure_analysis_context(bundle)
-        source = find_node(nodes, selected_node_ids[0])
-        target = find_node(nodes, selected_node_ids[1])
-        if source is None or target is None:
-            return {"shapes": [], "traces": []}
-        link_result = compute_bidirectional_link_result(source, target)
-        return overlay_from_result(
-            link_result["forward_result"],
-            source["longitude"],
-            source["latitude"],
-            target["longitude"],
-            target["latitude"],
-            link_result["good_link"],
-        )
-
-    if point_path_data:
-        source = find_node(nodes, point_path_data.get("source_node_id"))
-        target_lon = point_path_data.get("target_longitude")
-        target_lat = point_path_data.get("target_latitude")
-        if source is None or target_lon is None or target_lat is None:
-            return {"shapes": [], "traces": []}
-        bbox = normalize_bbox(
-            bbox_data["min_lon"],
-            bbox_data["min_lat"],
-            bbox_data["max_lon"],
-            bbox_data["max_lat"],
-        )
-        bundle = get_map_bundle(*bbox)
-        ensure_analysis_context(bundle)
-        result = compute_path_loss(
-            (source["longitude"], source["latitude"]),
-            (float(target_lon), float(target_lat)),
-            tx_height=source["height_agl_m"],
-            rx_height=float(global_rx_height_agl or DEFAULT_NODE_HEIGHT_M),
-            tx_power_dbm=source["tx_power_dbm"],
-            tx_gain_dbi=source["antenna_gain_dbi"],
-            rx_gain_dbi=float(global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI),
-        )
-        return overlay_from_result(
-            result,
-            source["longitude"],
-            source["latitude"],
-            float(target_lon),
-            float(target_lat),
-            result["rssi_dbm"] > MIN_LINK_RSSI_DBM,
-        )
-
-    return {"shapes": [], "traces": []}
 
 
 def empty_path_profile_figure(message="Select two nodes or use Draw Path To Map Point to inspect a path profile."):
@@ -1552,6 +2238,7 @@ def build_path_profile_figure(source_name, target_name, result, source_color="#2
     fresnel_upper = np.asarray(result["fresnel_upper_m"], dtype=np.float64)
     fresnel_lower = np.asarray(result["fresnel_lower_m"], dtype=np.float64)
     blockage_fraction = np.asarray(result["blockage_fraction"], dtype=np.float64)
+    attenuation_per_sample_db = np.asarray(result["attenuation_per_sample_db"], dtype=np.float64)
     terrain_only_blocked = np.asarray(result["terrain_only_blocked"], dtype=bool)
     direct_los_hits = np.asarray(result["direct_los_hits"], dtype=bool)
     attenuation_events = (blockage_fraction > 0) & ~terrain_only_blocked
@@ -1616,13 +2303,22 @@ def build_path_profile_figure(source_name, target_name, result, source_color="#2
                 mode="markers",
                 marker={
                     "size": 8 + 12 * blockage_fraction[attenuation_events],
-                    "color": blockage_fraction[attenuation_events],
-                    "colorscale": "Reds",
-                    "cmin": 0,
-                    "cmax": 1,
-                    "line": {"color": "black", "width": 0.5},
-                    "colorbar": {"title": "Blocked fraction"},
+                    "color": ATTENUATION_EVENT_COLOR,
+                    "line": {"color": ATTENUATION_EVENT_EDGE_COLOR, "width": 0.75},
+                    "opacity": 0.88,
                 },
+                customdata=np.column_stack(
+                    (
+                        blockage_fraction[attenuation_events],
+                        attenuation_per_sample_db[attenuation_events],
+                    )
+                ),
+                hovertemplate=(
+                    "Attenuation event<br>"
+                    "Distance=%{x:.3f} km<br>"
+                    "Blocked fraction=%{customdata[0]:.2f}<br>"
+                    "Added loss=%{customdata[1]:.2f} dB<extra></extra>"
+                ),
                 name="Attenuation events",
             )
         )
@@ -1644,7 +2340,7 @@ def build_path_profile_figure(source_name, target_name, result, source_color="#2
                 x=distance[terrain_only_blocked],
                 y=terrain_profile[terrain_only_blocked],
                 mode="markers",
-                marker={"symbol": "diamond", "size": 8, "color": "purple"},
+                marker={"symbol": "diamond", "size": 8, "color": TERRAIN_BLOCK_COLOR},
                 name="Terrain LOS block",
             )
         )
@@ -1705,11 +2401,10 @@ def build_path_profile_figure(source_name, target_name, result, source_color="#2
     return fig
 
 
-def build_node_summary(nodes, selected_node_ids, calculation_store, overlay_selection_store):
+def build_node_summary(nodes, selected_node_ids, overlay_selection_store):
     if not nodes:
         return html.Div("No nodes added yet.", style={"color": "#cbd5e1"})
 
-    del calculation_store
     normalized_nodes = [with_node_defaults(node) for node in nodes]
     selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in normalized_nodes])
     selected_set = set(selected_node_ids)
@@ -1886,8 +2581,7 @@ def build_node_summary(nodes, selected_node_ids, calculation_store, overlay_sele
 
 
 def parse_uploaded_nodes(contents):
-    content_type, content_string = contents.split(",", 1)
-    del content_type
+    _content_type, content_string = contents.split(",", 1)
     decoded = base64.b64decode(content_string)
     frame = pd.read_csv(io.StringIO(decoded.decode("utf-8")))
     expected = {"name", "longitude", "latitude"}
@@ -1913,27 +2607,12 @@ def parse_uploaded_nodes(contents):
     return frame
 
 
-def build_placeholder_map(message="Press Update Graph to load the map."):
-    fig = go.Figure()
-    fig.add_annotation(
-        text=message,
-        x=0.5,
-        y=0.5,
-        xref="paper",
-        yref="paper",
-        showarrow=False,
-        font={"color": "#e5e7eb", "family": "Open Sans, sans-serif", "size": 16},
+def build_node_upload_component():
+    return dcc.Upload(
+        id="node-upload",
+        children=html.Button("Load Nodes CSV", style={"width": "100%"}),
+        multiple=False,
     )
-    fig.update_layout(
-        height=720,
-        margin={"l": 20, "r": 20, "t": 20, "b": 20},
-        font={"family": "Open Sans, sans-serif", "color": "#e5e7eb"},
-        paper_bgcolor="#111827",
-        plot_bgcolor="#111827",
-        xaxis={"visible": False},
-        yaxis={"visible": False},
-    )
-    return fig
 
 
 def info_banner(children, background_color="#c92a2a"):
@@ -1950,19 +2629,37 @@ def info_banner(children, background_color="#c92a2a"):
     )
 
 
-app = Dash()
-app.title = "🏔️Non Flatlander Mesh Terrain Planner (NF-MTP)"
+app = Dash(
+    external_scripts=[MAPLIBRE_JS_URL],
+    external_stylesheets=[MAPLIBRE_CSS_URL],
+)
+app.title = "Non Flatlander Mesh Terrain Planner (NF-MTP)"
+
+
+@app.server.route("/terrain-dem/<token>/<int:z>/<int:x>/<int:y>.png")
+def serve_terrain_dem_tile(token, z, x, y):
+    try:
+        png_bytes = build_terrain_dem_tile_png(token, z, x, y)
+    except Exception as exc:
+        return Response(str(exc), status=404, mimetype="text/plain")
+    return Response(png_bytes, mimetype="image/png")
 
 app.layout = [
     dcc.Store(id="nodes-store", data=[]),
     dcc.Store(id="node-counter-store", data=0),
     dcc.Store(id="selected-node-ids-store", data=[]),
+    dcc.Store(id="node-upload-reset-store", data=0),
     dcc.Store(id="map-click-mode-store", data={"mode": "none", "node_id": None}),
+    dcc.Store(id="map-camera-store", data=DEFAULT_BBOX),
+    dcc.Store(id="map-camera-revision-store", data=0),
+    dcc.Store(id="map-view-store", data=DEFAULT_BBOX),
+    dcc.Store(id="native-map-spec-store", data=None),
+    dcc.Store(id="native-map-hover-store", data=None),
     dcc.Store(id="bbox-store", data=None),
     dcc.Store(id="rssi-calculation-store", data=None),
     dcc.Store(id="rssi-overlay-selection-store", data={}),
-    dcc.Store(id="new-primary-node-store", data=None),
     dcc.Store(id="map-interaction-loading-store", data=False),
+    dcc.Store(id="map-interaction-loading-message-store", data=DEFAULT_MAP_LOADING_MESSAGE),
     dcc.Store(id="rssi-run-request-store", data=None),
     dcc.Store(id="rssi-progress-meta-store", data=None),
     dcc.Store(id="rssi-progress-complete-store", data=None),
@@ -2003,6 +2700,13 @@ app.layout = [
                                 n_clicks=0,
                                 style={"width": "100%"},
                             ),
+                            html.Button(
+                                "Set Terrain Load Box From View",
+                                id="toggle-terrain-bbox",
+                                n_clicks=0,
+                                style={"width": "100%"},
+                            ),
+                            html.Div(id="terrain-bbox-status", style={"fontSize": "12px", "color": "#cbd5e1"}),
                             html.Details(
                                 [
                                     html.Summary(
@@ -2024,6 +2728,13 @@ app.layout = [
                                             dcc.Input(id="max_lon", type="number", value=DEFAULT_BBOX["max_lon"], style={"width": "100%"}),
                                             html.Div("Maximum latitude (north boundary)", style={"fontSize": "12px", "color": "#cbd5e1"}),
                                             dcc.Input(id="max_lat", type="number", value=DEFAULT_BBOX["max_lat"], style={"width": "100%"}),
+                                            html.Div("Base map style", style={"fontWeight": "600", "marginTop": "8px"}),
+                                            dcc.Dropdown(
+                                                id="base-map-style",
+                                                options=BASE_MAP_STYLE_OPTIONS,
+                                                value="satellite",
+                                                clearable=False,
+                                            ),
                                             html.Div("Elevation colormap", style={"fontWeight": "600", "marginTop": "8px"}),
                                             dcc.Dropdown(
                                                 id="elevation-colormap",
@@ -2031,7 +2742,7 @@ app.layout = [
                                                 value="Magma",
                                                 clearable=False,
                                             ),
-                                            html.Button("Update Graph (Can take a bit)", id="update_graph", n_clicks=0, style={"width": "100%"}),
+                                            html.Button("Load Elevation + Worldcover", id="update_graph", n_clicks=0, style={"width": "100%"}),
                                         ],
                                         style={"display": "flex", "flexDirection": "column", "gap": "8px", "marginTop": "10px"},
                                     ),
@@ -2064,6 +2775,14 @@ app.layout = [
                                                 options=[{"label": value, "value": value} for value in RSSI_COLOR_SCALE_OPTIONS],
                                                 value="Turbo",
                                                 clearable=False,
+                                            ),
+                                            html.Div("RSSI display mode", style={"fontWeight": "600", "marginTop": "8px"}),
+                                            dcc.RadioItems(
+                                                id="rssi-render-mode",
+                                                options=RSSI_RENDER_MODE_OPTIONS,
+                                                value="max-rssi",
+                                                labelStyle={"display": "block", "marginBottom": "4px"},
+                                                inputStyle={"marginRight": "8px"},
                                             ),
                                             html.Button("Draw RSSI For All Nodes", id="draw-rssi-overlay", n_clicks=0, style={"width": "100%"}),
                                             html.Progress(id="rssi-progress-bar", value="0", max="100", style={"width": "100%", "height": "14px"}),
@@ -2104,23 +2823,20 @@ app.layout = [
                 [
                     html.Div(
                         [
-                            dcc.Loading(
+                            html.Div(
                                 [
-                                    dcc.Graph(
-                                        id="graph-map",
-                                        figure=build_placeholder_map(),
-                                        style={"height": "78vh", "width": "100%"},
-                                        config={"responsive": True},
-                                    ),
-                                    html.Div(id="rssi-worker", style={"display": "none"}),
+                                    html.Div(id="native-map", className="native-map-canvas"),
+                                    html.Div(id="native-map-path-overlay", className="native-map-path-overlay"),
+                                    html.Div(id="native-map-legend", className="native-map-legend"),
+                                    html.Div(id="native-map-render-ack", style={"display": "none"}),
                                 ],
-                                type="circle",
+                                className="native-map-shell",
                             ),
                             html.Div(
                                 html.Div(
                                     [
                                         html.Div(className="map-loading-spinner"),
-                                        html.Div("Updating map..."),
+                                        html.Div(DEFAULT_MAP_LOADING_MESSAGE, id="map-interaction-overlay-label"),
                                     ],
                                     className="map-loading-content",
                                 ),
@@ -2142,6 +2858,12 @@ app.layout = [
                         ],
                         style={"position": "relative"},
                     ),
+                    html.Div(
+                        "Move the cursor over the map to inspect coordinates, elevation, and RSSI.",
+                        id="native-map-hover-readout",
+                        className="native-map-hover-panel",
+                    ),
+                    html.Div(id="rssi-worker", style={"display": "none"}),
                     dcc.Loading(
                         dcc.Graph(
                             id="path-profile-graph",
@@ -2204,11 +2926,7 @@ app.layout = [
                             html.Summary("CSV Import / Export", style={"fontWeight": "600", "cursor": "pointer"}),
                             html.Div(
                                 [
-                                    dcc.Upload(
-                                        id="node-upload",
-                                        children=html.Button("Load Nodes CSV", style={"width": "100%"}),
-                                        multiple=False,
-                                    ),
+                                    build_node_upload_component(),
                                     html.Button("Save Nodes CSV", id="save-nodes", n_clicks=0, style={"width": "100%"}),
                                     html.Div(id="node-action-message", style={"fontSize": "12px", "color": "#cbd5e1"}),
                                 ],
@@ -2238,22 +2956,39 @@ app.layout = [
 
 
 @app.callback(
+    Output("node-upload", "contents"),
+    Output("node-upload", "filename"),
+    Output("node-upload", "last_modified"),
+    Input("node-upload-reset-store", "data"),
+    prevent_initial_call=True,
+)
+def clear_node_upload_selection(_reset_revision):
+    return None, None, None
+
+
+@app.callback(
     Output("bbox-store", "data"),
+    Output("map-camera-store", "data", allow_duplicate=True),
+    Output("map-view-store", "data", allow_duplicate=True),
+    Output("map-camera-revision-store", "data", allow_duplicate=True),
     Input("update_graph", "n_clicks"),
     State("min_lon", "value"),
     State("min_lat", "value"),
     State("max_lon", "value"),
     State("max_lat", "value"),
+    State("map-camera-revision-store", "data"),
     prevent_initial_call=True,
 )
-def update_bbox_store(_n_clicks, min_lon, min_lat, max_lon, max_lat):
-    min_lon, min_lat, max_lon, max_lat = normalize_bbox(min_lon, min_lat, max_lon, max_lat)
-    return {
-        "min_lon": min_lon,
-        "min_lat": min_lat,
-        "max_lon": max_lon,
-        "max_lat": max_lat,
-    }
+def update_bbox_store(_n_clicks, min_lon, min_lat, max_lon, max_lat, camera_revision):
+    bbox = bbox_dict(
+        {
+            "min_lon": min_lon,
+            "min_lat": min_lat,
+            "max_lon": max_lon,
+            "max_lat": max_lat,
+        }
+    )
+    return bbox, bbox, bbox, next_revision(camera_revision)
 
 
 @app.callback(
@@ -2297,11 +3032,11 @@ def update_elevation_clip_controls(bbox_data):
 @app.callback(
     Output("elevation_clip_range", "value", allow_duplicate=True),
     Input("clip-visible-elevation-range", "n_clicks"),
-    State("graph-map", "relayoutData"),
+    State("map-view-store", "data"),
     State("bbox-store", "data"),
     prevent_initial_call=True,
 )
-def set_elevation_clip_to_current_view(_n_clicks, relayout_data, bbox_data):
+def set_elevation_clip_to_current_view(_n_clicks, map_view_data, bbox_data):
     if not bbox_data:
         raise PreventUpdate
 
@@ -2317,9 +3052,15 @@ def set_elevation_clip_to_current_view(_n_clicks, relayout_data, bbox_data):
     terrain_lat = bundle["terrain_display_lat_axis"][::-1]
     terrain_display = np.flipud(bundle["terrain_display"])
 
-    full_x_range = (float(np.min(terrain_lon)), float(np.max(terrain_lon)))
-    full_y_range = (float(np.min(terrain_lat)), float(np.max(terrain_lat)))
-    x_range, y_range = ranges_from_relayout_data(relayout_data, full_x_range, full_y_range)
+    current_view = map_view_data or bbox_data
+    x_range = (
+        float(current_view["min_lon"]),
+        float(current_view["max_lon"]),
+    )
+    y_range = (
+        float(current_view["min_lat"]),
+        float(current_view["max_lat"]),
+    )
 
     lon_mask = (terrain_lon >= x_range[0]) & (terrain_lon <= x_range[1])
     lat_mask = (terrain_lat >= y_range[0]) & (terrain_lat <= y_range[1])
@@ -2345,8 +3086,19 @@ def set_elevation_clip_to_current_view(_n_clicks, relayout_data, bbox_data):
     Input("rssi-calculation-store", "data"),
 )
 def update_top_banner(bbox_data, nodes, calculation_store):
+    outside_nodes = nodes_outside_loaded_bbox(nodes or [], bbox_data) if nodes else []
+    if outside_nodes:
+        names = ", ".join(outside_nodes[:4])
+        suffix = "" if len(outside_nodes) <= 4 else f", and {len(outside_nodes) - 4} more"
+        return info_banner(
+            f"Node(s) {names}{suffix} are outside the loaded terrain area. Expand or reload the terrain bounds before using terrain-based analysis."
+        )
+
     if not bbox_data:
-        return info_banner("Enter the coordinates for the map area you want to inspect, then click Update Graph (This can take up to a minute, especially with larger areas)")
+        return info_banner(
+            "The base map is ready. Use the map settings or copy the current native map viewport into the load bounds, then load elevation + worldcover data for terrain analysis.",
+            background_color="#1d4ed8",
+        )
 
     if calculation_store:
         current_signatures = {str(node["id"]): node_signature(node) for node in (nodes or [])}
@@ -2365,24 +3117,49 @@ def update_top_banner(bbox_data, nodes, calculation_store):
     prevent_initial_call=True,
 )
 def toggle_click_add_mode(_n_clicks, click_mode):
-    mode = (click_mode or {}).get("mode", "none")
-    if mode == "add-node":
-        return {"mode": "none", "node_id": None}
-    return {"mode": "add-node", "node_id": None}
+    return toggle_click_mode_state(click_mode, "add-node")
+
+
+@app.callback(
+    Output("map-click-mode-store", "data", allow_duplicate=True),
+    Input("toggle-terrain-bbox", "n_clicks"),
+    State("map-click-mode-store", "data"),
+    prevent_initial_call=True,
+)
+def toggle_terrain_bbox_mode(_n_clicks, click_mode):
+    return toggle_click_mode_state(click_mode, "terrain-bbox")
 
 
 @app.callback(
     Output("toggle-click-add", "children"),
     Output("click-add-status", "children"),
     Input("map-click-mode-store", "data"),
-    State("nodes-store", "data"),
 )
-def update_click_add_text(click_mode, nodes):
-    del nodes
-    mode = (click_mode or {}).get("mode", "none")
-    if mode == "add-node":
-        return "Disable Click-To-Add", "Click once on the map to add a node."
-    return "Enable Click-To-Add", "Click-to-add is off."
+def update_click_add_text(click_mode):
+    return click_mode_button_copy(
+        click_mode,
+        "add-node",
+        "Disable Click-To-Add",
+        "Click on the map to add nodes. This mode stays active until you disable it.",
+        "Enable Click-To-Add",
+        "Click-to-add is off.",
+    )
+
+
+@app.callback(
+    Output("toggle-terrain-bbox", "children"),
+    Output("terrain-bbox-status", "children"),
+    Input("map-click-mode-store", "data"),
+)
+def update_terrain_bbox_text(click_mode):
+    return click_mode_button_copy(
+        click_mode,
+        "terrain-bbox",
+        "Cancel Terrain Load Box Selection",
+        "Pan or zoom the native map to the desired area. The next viewport change fills the terrain load bounds.",
+        "Set Terrain Load Box From View",
+        "Use this to copy the next native map viewport into the terrain load bounds.",
+    )
 
 
 @app.callback(
@@ -2399,47 +3176,6 @@ def update_point_path_button(selected_node_ids, nodes):
     if primary is None:
         return "Draw Path To Map Point", True
     return f"Draw Path From {primary['name']} To Map Point", False
-
-
-@app.callback(
-    Output("map-click-mode-store", "data", allow_duplicate=True),
-    Output("node-action-message", "children", allow_duplicate=True),
-    Input("draw-point-path", "n_clicks"),
-    State("selected-node-ids-store", "data"),
-    State("nodes-store", "data"),
-    prevent_initial_call=True,
-)
-def enable_point_path_mode(n_clicks, selected_node_ids, nodes):
-    if not n_clicks:
-        raise PreventUpdate
-
-    normalized_nodes = [with_node_defaults(node) for node in (nodes or [])]
-    selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in normalized_nodes])
-    primary_id = str(selected_node_ids[-1]) if selected_node_ids else None
-    primary = find_node(normalized_nodes, primary_id)
-    if primary is None:
-        return no_update, "Select a primary node before drawing a path to a map point."
-    return {"mode": "point-path", "node_id": str(primary["id"])}, f"Click once on the map to trace from {primary['name']}."
-
-
-@app.callback(
-    Output("map-click-mode-store", "data", allow_duplicate=True),
-    Output("node-action-message", "children", allow_duplicate=True),
-    Input({"type": "move-node-button", "node_id": ALL}, "n_clicks"),
-    State("nodes-store", "data"),
-    prevent_initial_call=True,
-)
-def enable_move_node_mode(_n_clicks, nodes):
-    triggered = ctx.triggered_id
-    if not triggered or "node_id" not in triggered:
-        raise PreventUpdate
-    if not ctx.triggered or not ctx.triggered[0].get("value"):
-        raise PreventUpdate
-
-    node = find_node(nodes or [], triggered["node_id"])
-    if node is None:
-        raise PreventUpdate
-    return {"mode": "move-node", "node_id": str(node["id"])}, f"Click once on the map to move {node['name']}."
 
 
 @app.callback(
@@ -2465,75 +3201,63 @@ def delete_node(_n_clicks, nodes):
 
 
 @app.callback(
-    Output("map-click-mode-store", "data", allow_duplicate=True),
-    Output("node-action-message", "children", allow_duplicate=True),
-    Input("graph-map", "relayoutData"),
-    State("map-click-mode-store", "data"),
-    prevent_initial_call=True,
-)
-def cancel_move_mode_on_map_relayout(relayout_data, click_mode):
-    if not relayout_data:
-        raise PreventUpdate
-    if (click_mode or {}).get("mode") != "move-node":
-        raise PreventUpdate
-    return {"mode": "none", "node_id": None}, "Move-node mode canceled."
-
-
-app.clientside_callback(
-    ClientsideFunction(namespace="clientside", function_name="handleMapClick"),
-    Output("nodes-store", "data", allow_duplicate=True),
-    Output("node-counter-store", "data", allow_duplicate=True),
-    Output("new-primary-node-store", "data", allow_duplicate=True),
-    Output("map-click-mode-store", "data", allow_duplicate=True),
-    Output("point-path-store", "data", allow_duplicate=True),
-    Output("selected-node-ids-store", "data", allow_duplicate=True),
-    Output("node-action-message", "children", allow_duplicate=True),
-    Output("map-interaction-loading-store", "data", allow_duplicate=True),
-    Input("graph-map", "clickData"),
-    State("map-click-mode-store", "data"),
-    State("nodes-store", "data"),
-    State("node-counter-store", "data"),
-    State("selected-node-ids-store", "data"),
-    prevent_initial_call=True,
-)
-
-
-@app.callback(
     Output("selected-node-ids-store", "data", allow_duplicate=True),
     Input({"type": "node-select", "node_id": ALL}, "n_clicks"),
-    Input("graph-map", "clickData"),
     State("selected-node-ids-store", "data"),
     State("nodes-store", "data"),
-    State("map-click-mode-store", "data"),
     prevent_initial_call=True,
 )
-def update_selected_nodes(_n_clicks, click_data, selected_node_ids, nodes, click_mode):
+def update_selected_nodes(_n_clicks, selected_node_ids, nodes):
     triggered = ctx.triggered_id
     valid_ids = [str(node["id"]) for node in (nodes or [])]
     if isinstance(triggered, dict) and "node_id" in triggered:
         if not ctx.triggered or not ctx.triggered[0].get("value"):
             raise PreventUpdate
-        return toggle_selected_node(selected_node_ids, triggered["node_id"], valid_ids)
-    if triggered != "graph-map":
-        raise PreventUpdate
-    if (click_mode or {}).get("mode", "none") != "none":
-        raise PreventUpdate
-    node_id = clicked_node_id_from_click_data(click_data)
-    if node_id is None:
-        raise PreventUpdate
-    return toggle_selected_node(selected_node_ids, node_id, valid_ids)
+        node_id = str(triggered["node_id"])
+        if node_id not in set(valid_ids):
+            raise PreventUpdate
+        return select_primary_node(selected_node_ids, node_id)
+    raise PreventUpdate
 
 
 @app.callback(
-    Output("selected-node-ids-store", "data", allow_duplicate=True),
-    Input("new-primary-node-store", "data"),
+    Output("map-click-mode-store", "data", allow_duplicate=True),
+    Output("node-action-message", "children", allow_duplicate=True),
+    Input("draw-point-path", "n_clicks"),
+    Input({"type": "move-node-button", "node_id": ALL}, "n_clicks"),
     State("selected-node-ids-store", "data"),
+    State("nodes-store", "data"),
     prevent_initial_call=True,
 )
-def apply_new_primary_node(primary_node_id, selected_node_ids):
-    if not primary_node_id:
-        raise PreventUpdate
-    return select_primary_node(selected_node_ids, primary_node_id)
+def update_map_click_mode(draw_point_clicks, _move_clicks, selected_node_ids, nodes):
+    triggered = ctx.triggered_id
+
+    if triggered == "draw-point-path":
+        if not draw_point_clicks:
+            raise PreventUpdate
+        normalized_nodes = [with_node_defaults(node) for node in (nodes or [])]
+        selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in normalized_nodes])
+        primary_id = str(selected_node_ids[-1]) if selected_node_ids else None
+        primary = find_node(normalized_nodes, primary_id)
+        if primary is None:
+            return no_update, "Select a primary node before drawing a path to a map point."
+        return {
+            "mode": "point-path",
+            "node_id": str(primary["id"]),
+        }, f"Click once on the map to trace from {primary['name']}."
+
+    if isinstance(triggered, dict) and triggered.get("type") == "move-node-button":
+        if not ctx.triggered or not ctx.triggered[0].get("value"):
+            raise PreventUpdate
+        node = find_node(nodes or [], triggered["node_id"])
+        if node is None:
+            raise PreventUpdate
+        return {
+            "mode": "move-node",
+            "node_id": str(node["id"]),
+        }, f"Click once on the map to move {node['name']}."
+
+    raise PreventUpdate
 
 
 @app.callback(
@@ -2561,12 +3285,10 @@ def sync_selected_nodes(nodes, selected_node_ids):
 @app.callback(
     Output("nodes-store", "data", allow_duplicate=True),
     Input({"type": "node-config", "field": ALL, "node_id": ALL}, "value"),
-    State({"type": "node-config", "field": ALL, "node_id": ALL}, "id"),
     State("nodes-store", "data"),
     prevent_initial_call=True,
 )
-def update_node_config(_values, ids, nodes):
-    del _values
+def update_node_config(_values, nodes):
     triggered = ctx.triggered_id
     if not triggered or "node_id" not in triggered or "field" not in triggered:
         raise PreventUpdate
@@ -2594,12 +3316,10 @@ def update_node_config(_values, ids, nodes):
 @app.callback(
     Output("rssi-overlay-selection-store", "data", allow_duplicate=True),
     Input({"type": "rssi-node-enable", "node_id": ALL}, "value"),
-    State({"type": "rssi-node-enable", "node_id": ALL}, "id"),
     State("rssi-overlay-selection-store", "data"),
     prevent_initial_call=True,
 )
-def update_rssi_overlay_selection(_values, ids, selection_store):
-    del _values
+def update_rssi_overlay_selection(_values, selection_store):
     triggered = ctx.triggered_id
     if not triggered or "node_id" not in triggered:
         raise PreventUpdate
@@ -2615,6 +3335,10 @@ def update_rssi_overlay_selection(_values, ids, selection_store):
     Output("nodes-store", "data"),
     Output("node-counter-store", "data"),
     Output("selected-node-ids-store", "data", allow_duplicate=True),
+    Output("map-camera-store", "data", allow_duplicate=True),
+    Output("map-view-store", "data", allow_duplicate=True),
+    Output("map-camera-revision-store", "data", allow_duplicate=True),
+    Output("node-upload-reset-store", "data", allow_duplicate=True),
     Output("manual-node-name", "value"),
     Output("manual-node-lon", "value"),
     Output("manual-node-lat", "value"),
@@ -2628,10 +3352,13 @@ def update_rssi_overlay_selection(_values, ids, selection_store):
     State("nodes-store", "data"),
     State("node-counter-store", "data"),
     State("selected-node-ids-store", "data"),
+    State("node-upload-reset-store", "data"),
+    State("map-view-store", "data"),
+    State("map-camera-revision-store", "data"),
     prevent_initial_call=True,
 )
 def manage_nodes(
-    add_manual_clicks,
+    _add_manual_clicks,
     upload_contents,
     upload_filename,
     manual_name,
@@ -2640,9 +3367,10 @@ def manage_nodes(
     nodes,
     counter,
     selected_node_ids,
+    node_upload_reset_revision,
+    current_map_view,
+    camera_revision,
 ):
-    del add_manual_clicks
-
     nodes = list(nodes or [])
     counter = int(counter or 0)
     trigger = ctx.triggered_id
@@ -2653,8 +3381,20 @@ def manage_nodes(
         try:
             frame = parse_uploaded_nodes(upload_contents)
         except Exception as exc:
-            return no_update, no_update, no_update, no_update, no_update, no_update, f"CSV load failed: {exc}"
-        loaded_nodes = []
+            return (
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                f"CSV load failed: {exc}",
+            )
+        loaded_nodes = [with_node_defaults(node) for node in nodes]
         last_loaded_id = None
         for row in frame.itertuples(index=False):
             counter += 1
@@ -2670,13 +3410,38 @@ def manage_nodes(
                     "tx_power_dbm": float(row.tx_power_dbm),
                 }
             )
-        message = f"Loaded {len(loaded_nodes)} nodes from {upload_filename or 'CSV'}."
+        message = f"Loaded {len(frame)} nodes from {upload_filename or 'CSV'}."
         next_selected = select_primary_node(selected_node_ids, last_loaded_id) if last_loaded_id is not None else (selected_node_ids or [])
-        return loaded_nodes, counter, next_selected, "", None, None, message
+        next_view = fit_bbox_for_nodes(loaded_nodes) or current_map_view or DEFAULT_BBOX
+        return (
+            loaded_nodes,
+            counter,
+            next_selected,
+            next_view,
+            next_view,
+            next_revision(camera_revision),
+            next_revision(node_upload_reset_revision),
+            "",
+            None,
+            None,
+            message,
+        )
 
     if trigger == "add-manual-node":
         if not manual_name or manual_lon is None or manual_lat is None:
-            return no_update, no_update, no_update, no_update, no_update, no_update, "Manual node requires name, longitude, and latitude."
+            return (
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                "Manual node requires name, longitude, and latitude.",
+            )
         counter += 1
         node_id = f"node-{counter}"
         nodes.append(
@@ -2691,7 +3456,28 @@ def manage_nodes(
             }
         )
         message = f"Added node {manual_name}."
-        return nodes, counter, select_primary_node(selected_node_ids, node_id), "", None, None, message
+        current_view = current_map_view or DEFAULT_BBOX
+        next_view = no_update
+        next_camera = no_update
+        next_camera_revision = no_update
+        if not point_in_bbox(float(manual_lon), float(manual_lat), current_view):
+            fitted_view = fit_bbox_for_nodes(nodes) or current_view
+            next_view = fitted_view
+            next_camera = fitted_view
+            next_camera_revision = next_revision(camera_revision)
+        return (
+            nodes,
+            counter,
+            select_primary_node(selected_node_ids, node_id),
+            next_camera,
+            next_view,
+            next_camera_revision,
+            no_update,
+            "",
+            None,
+            None,
+            message,
+        )
 
     raise PreventUpdate
 
@@ -2732,98 +3518,157 @@ def save_nodes_csv(_n_clicks, nodes):
 
 
 @app.callback(
-    Output("graph-map", "figure"),
+    Output("native-map-spec-store", "data"),
+    Output("native-map-legend", "children"),
     Input("bbox-store", "data"),
     Input("nodes-store", "data"),
     Input("selected-node-ids-store", "data"),
     Input("elevation_alpha", "value"),
     Input("elevation_clip_range", "value"),
+    Input("base-map-style", "value"),
     Input("elevation-colormap", "value"),
     Input("rssi-calculation-store", "data"),
     Input("rssi-overlay-selection-store", "data"),
     Input("rssi-opacity", "value"),
     Input("rssi-colormap", "value"),
+    Input("rssi-render-mode", "value"),
     Input("point-path-store", "data"),
     State("global-rx-height-agl", "value"),
     State("global-rx-gain-dbi", "value"),
 )
-def update_map_figure(
+def update_native_map_spec(
     bbox_data,
     nodes,
     selected_node_ids,
     terrain_alpha,
     terrain_clip_range,
+    base_map_style,
     elevation_colormap,
     rssi_calculation_store,
     rssi_overlay_selection_store,
     rssi_opacity,
     rssi_colormap,
+    rssi_render_mode,
     point_path_data,
     global_rx_height_agl,
     global_rx_gain_dbi,
 ):
-    if not bbox_data:
-        return build_placeholder_map("Enter a map area above and click Update Graph.")
-    try:
-        bbox = normalize_bbox(
-            bbox_data["min_lon"],
-            bbox_data["min_lat"],
-            bbox_data["max_lon"],
-            bbox_data["max_lat"],
-        )
-        bundle = get_map_bundle(*bbox)
-    except Exception as exc:
-        return build_placeholder_map(f"Failed to load map data: {exc}")
-
     nodes = list(nodes or [])
-
-    rssi_overlay = compose_cached_rssi_overlay(bundle, rssi_calculation_store, rssi_overlay_selection_store or {})
-
+    overlay_context_key = native_map_overlay_context_key(nodes, selected_node_ids, point_path_data)
     try:
-        path_overlay = compute_map_path_overlay(
+        bundle = None
+        rssi_overlay = None
+
+        if bbox_data:
+            terrain_bbox = normalize_bbox(
+                bbox_data["min_lon"],
+                bbox_data["min_lat"],
+                bbox_data["max_lon"],
+                bbox_data["max_lat"],
+            )
+            bundle = get_map_bundle(*terrain_bbox)
+            if str(rssi_render_mode or "max-rssi") == "best-node":
+                rssi_overlay = resolve_rssi_provider_overlay(
+                    bundle,
+                    nodes,
+                    rssi_calculation_store,
+                    rssi_overlay_selection_store or {},
+                )
+            else:
+                rssi_overlay = resolve_rssi_overlay(bundle, nodes, rssi_calculation_store, rssi_overlay_selection_store or {})
+
+        path_overlay = compute_native_map_path_overlay(
             nodes,
             selected_node_ids,
             point_path_data,
-            bbox_data,
+            bundle,
             global_rx_height_agl,
             global_rx_gain_dbi,
         )
-    except Exception:
-        path_overlay = {"shapes": [], "traces": []}
 
-    return build_map_figure(
-        bundle,
-        nodes,
-        terrain_alpha or 0.0,
-        terrain_clip_range=terrain_clip_range,
-        elevation_colorscale=elevation_colormap or "Magma",
-        rssi_overlay=rssi_overlay,
-        rssi_colorscale=rssi_colormap or "Turbo",
-        shapes=path_overlay["shapes"],
-        path_traces=path_overlay["traces"],
-        rssi_opacity=rssi_opacity or 0.55,
-        selected_node_ids=selected_node_ids,
-    )
+        spec = build_native_map_spec(
+            bundle,
+            nodes,
+            terrain_alpha or 0.0,
+            terrain_clip_range=terrain_clip_range,
+            elevation_colorscale=elevation_colormap or "Magma",
+            rssi_overlay=rssi_overlay,
+            rssi_colorscale=rssi_colormap or "Turbo",
+            loaded_bbox=bbox_data,
+            selected_node_ids=selected_node_ids,
+            base_map_style=base_map_style or "satellite",
+            rssi_opacity=rssi_opacity or 0.55,
+            path_overlay=path_overlay,
+            overlay_context_key=overlay_context_key,
+        )
+        legends = build_native_map_legends(spec.get("terrain_legend"), spec.get("rssi_legend"))
+        return spec, legends
+    except Exception as exc:
+        try:
+            fallback_path_overlay = compute_native_map_path_overlay(
+                nodes,
+                selected_node_ids,
+                point_path_data,
+                None,
+                global_rx_height_agl,
+                global_rx_gain_dbi,
+            )
+        except Exception:
+            fallback_path_overlay = empty_native_path_overlay()
+
+        fallback_spec = {
+            "base_style_key": str(base_map_style or "satellite"),
+            "base_style": build_maplibre_style(base_map_style),
+            "terrain_dem": None,
+            "terrain_layer": None,
+            "rssi_layer": None,
+            "nodes": build_node_feature_collection(nodes, selected_node_ids),
+            "loaded_bbox": build_loaded_bbox_feature_collection(loaded_bbox=bbox_data),
+            "path_line": fallback_path_overlay.get("line", feature_collection()),
+            "attenuation_points": fallback_path_overlay.get("attenuation_points", feature_collection()),
+            "terrain_block_points": fallback_path_overlay.get("terrain_block_points", feature_collection()),
+            "terrain_legend": None,
+            "rssi_legend": None,
+            "overlay_context_key": overlay_context_key,
+            "error": f"Failed to refresh native map overlays: {exc}",
+        }
+        return fallback_spec, html.Div()
+
+
+app.clientside_callback(
+    ClientsideFunction(namespace="clientside", function_name="renderNativeMap"),
+    Output("native-map-render-ack", "children"),
+    Input("native-map-spec-store", "data"),
+    Input("map-camera-store", "data"),
+    Input("map-camera-revision-store", "data"),
+    Input("nodes-store", "data"),
+    Input("node-counter-store", "data"),
+    Input("selected-node-ids-store", "data"),
+    Input("point-path-store", "data"),
+    Input("map-click-mode-store", "data"),
+)
 
 
 @app.callback(
     Output("map-interaction-loading-store", "data", allow_duplicate=True),
+    Output("map-interaction-loading-message-store", "data", allow_duplicate=True),
     Input("update_graph", "n_clicks"),
     prevent_initial_call=True,
 )
 def start_map_loading(_n_clicks):
-    return True
+    return True, DEFAULT_MAP_LOADING_MESSAGE
 
 
 @app.callback(
     Output("map-interaction-loading-store", "data", allow_duplicate=True),
-    Input("graph-map", "figure"),
+    Output("map-interaction-loading-message-store", "data", allow_duplicate=True),
+    Input("native-map-render-ack", "children"),
     State("map-interaction-loading-store", "data"),
     prevent_initial_call=True,
 )
-def clear_map_interaction_loading(_figure, is_loading):
+def clear_map_interaction_loading(_ack, is_loading):
     if is_loading:
-        return False
+        return False, DEFAULT_MAP_LOADING_MESSAGE
     raise PreventUpdate
 
 
@@ -2839,17 +3684,95 @@ def update_map_interaction_overlay(is_loading, current_style):
 
 
 @app.callback(
+    Output("map-interaction-overlay-label", "children"),
+    Input("map-interaction-loading-message-store", "data"),
+)
+def update_map_interaction_overlay_label(message):
+    return str(message or DEFAULT_MAP_LOADING_MESSAGE)
+
+
+@app.callback(
+    Output("native-map-hover-readout", "children"),
+    Input("native-map-hover-store", "data"),
+    State("bbox-store", "data"),
+    State("nodes-store", "data"),
+    State("rssi-calculation-store", "data"),
+    State("rssi-overlay-selection-store", "data"),
+)
+def update_native_map_hover_readout(hover_data, bbox_data, nodes, calculation_store, overlay_selection_store):
+    if not hover_data:
+        return "Move the cursor over the map to inspect coordinates, elevation, and RSSI."
+
+    longitude = hover_data.get("longitude")
+    latitude = hover_data.get("latitude")
+    if longitude is None or latitude is None:
+        return "Move the cursor over the map to inspect coordinates, elevation, and RSSI."
+
+    feature = hover_data.get("feature") or {}
+    rows = []
+    if feature.get("name"):
+        rows.append(html.Div(str(feature["name"]), className="native-map-hover-title"))
+    rows.extend(
+        [
+            html.Div(f"Longitude {float(longitude):.5f}"),
+            html.Div(f"Latitude {float(latitude):.5f}"),
+        ]
+    )
+
+    terrain_value = None
+    rssi_value = None
+    if bbox_data:
+        try:
+            bbox = normalize_bbox(
+                bbox_data["min_lon"],
+                bbox_data["min_lat"],
+                bbox_data["max_lon"],
+                bbox_data["max_lat"],
+            )
+            bundle = get_map_bundle(*bbox)
+            terrain_value = sample_grid_value(
+                bundle["terrain_display"],
+                bundle["terrain_display_lon_axis"],
+                bundle["terrain_display_lat_axis"],
+                longitude,
+                latitude,
+            )
+            rssi_overlay = resolve_rssi_overlay(bundle, nodes or [], calculation_store, overlay_selection_store or {})
+            if rssi_overlay is not None:
+                rssi_value = sample_grid_value(
+                    rssi_overlay["max_rssi"],
+                    rssi_overlay["lon_axis"],
+                    rssi_overlay["lat_axis"],
+                    longitude,
+                    latitude,
+                )
+        except Exception:
+            terrain_value = None
+            rssi_value = None
+
+    rows.append(html.Div(f"Elevation {terrain_value:.1f} m" if terrain_value is not None else "Elevation n/a"))
+    rows.append(html.Div(f"RSSI {rssi_value:.1f} dBm" if rssi_value is not None else "RSSI n/a"))
+
+    if feature.get("kind") == "attenuation-event":
+        rows.append(html.Div(f"Blocked fraction {float(feature.get('blocked_fraction', 0.0)):.2f}"))
+        rows.append(html.Div(f"Added loss {float(feature.get('added_loss_db', 0.0)):.2f} dB"))
+    elif feature.get("kind") == "terrain-los-block":
+        rows.append(html.Div(f"Added loss {float(feature.get('added_loss_db', 0.0)):.2f} dB"))
+
+    return rows
+
+
+@app.callback(
     Output("node-summary", "children"),
     Input("nodes-store", "data"),
     Input("selected-node-ids-store", "data"),
     Input("rssi-calculation-store", "data"),
     Input("rssi-overlay-selection-store", "data"),
 )
-def update_node_summary(nodes, selected_node_ids, calculation_store, overlay_selection_store):
+def update_node_summary(nodes, selected_node_ids, _calculation_store, overlay_selection_store):
     return build_node_summary(
         list(nodes or []),
         [str(value) for value in (selected_node_ids or [])][:2],
-        calculation_store,
         overlay_selection_store or {},
     )
 
@@ -2860,6 +3783,8 @@ def update_node_summary(nodes, selected_node_ids, calculation_store, overlay_sel
     Output("rssi-progress-complete-store", "data"),
     Output("node-action-message", "children", allow_duplicate=True),
     Output("rssi-worker", "children"),
+    Output("map-interaction-loading-store", "data", allow_duplicate=True),
+    Output("map-interaction-loading-message-store", "data", allow_duplicate=True),
     Input("rssi-run-request-store", "data"),
     State("bbox-store", "data"),
     State("nodes-store", "data"),
@@ -2885,9 +3810,25 @@ def generate_rssi_overlay(
         raise PreventUpdate
     nodes = list(nodes or [])
     if not nodes:
-        return no_update, no_update, {"request_id": request_id, "done": True}, "Add at least one node before drawing RSSI.", f"noop-{request_id}"
+        return (
+            no_update,
+            no_update,
+            {"request_id": request_id, "done": True},
+            "Add at least one node before drawing RSSI.",
+            f"noop-{request_id}",
+            False,
+            DEFAULT_MAP_LOADING_MESSAGE,
+        )
     if not bbox_data:
-        return no_update, no_update, {"request_id": request_id, "done": True}, "Load a map area before drawing RSSI.", f"noop-{request_id}"
+        return (
+            no_update,
+            no_update,
+            {"request_id": request_id, "done": True},
+            "Load elevation + worldcover data before drawing RSSI.",
+            f"noop-{request_id}",
+            False,
+            DEFAULT_MAP_LOADING_MESSAGE,
+        )
 
     bbox = normalize_bbox(
         bbox_data["min_lon"],
@@ -2908,7 +3849,15 @@ def generate_rssi_overlay(
             node_overlay_keys[node_id] = cache_key
             node_signatures[node_id] = node_signature(node)
     except Exception as exc:
-        return no_update, no_update, {"request_id": request_id, "done": True}, f"RSSI overlay failed: {exc}", f"error-{request_id}"
+        return (
+            no_update,
+            no_update,
+            {"request_id": request_id, "done": True},
+            f"RSSI overlay failed: {exc}",
+            f"error-{request_id}",
+            False,
+            DEFAULT_MAP_LOADING_MESSAGE,
+        )
 
     calc_store = {
         "request_id": request_id,
@@ -2926,7 +3875,15 @@ def generate_rssi_overlay(
         for node in nodes
     }
     mode = "with path attenuation" if include_ground_loss else "with viewshed + FSPL only"
-    return calc_store, overlay_selection, {"request_id": request_id, "done": True}, f"RSSI overlay updated {mode}.", f"done-{request_id}"
+    return (
+        calc_store,
+        overlay_selection,
+        {"request_id": request_id, "done": True},
+        f"RSSI overlay updated {mode}.",
+        f"done-{request_id}",
+        no_update,
+        no_update,
+    )
 
 
 @app.callback(
@@ -2959,6 +3916,8 @@ app.clientside_callback(
     Output("rssi-progress-interval", "disabled", allow_duplicate=True),
     Output("rssi-progress-complete-store", "data", allow_duplicate=True),
     Output("rssi-run-request-store", "data"),
+    Output("map-interaction-loading-store", "data", allow_duplicate=True),
+    Output("map-interaction-loading-message-store", "data", allow_duplicate=True),
     Input("draw-rssi-overlay", "n_clicks"),
     State("nodes-store", "data"),
     State("include-rssi-ground-loss", "value"),
@@ -3008,7 +3967,7 @@ def update_path_profile(point_path_data, selected_node_ids, nodes, bbox_data, gl
     selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in nodes])
     color_lookup = node_color_map(nodes)
     if not bbox_data:
-        return empty_path_profile_figure("Load a map area to inspect path profiles."), html.Div()
+        return empty_path_profile_figure("Load elevation + worldcover data to inspect path profiles."), html.Div()
     try:
         bbox = normalize_bbox(
             bbox_data["min_lon"],
