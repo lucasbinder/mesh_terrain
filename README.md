@@ -127,7 +127,7 @@ Single click to pan, scroll to zoom, and right click to rotate around terrain
 - The RSSI opacity and colormap can be selected using the slider or dropdown respectively
 
 ### Viewshed Assessment
-![Viewshed Assessment](viewshed_assessment/img.png)
+![Viewshed Assessment](images/viewshed_assessment.png)
 - The goal of placing infrastructure nodes is generally to maximize land coverage
   - While placing a node on the top of a mountain is ideal, sometimes constraints such as node visibility make this infeasible. In some cases, the top of the mountain may not even be the best place.
 - The viewshed assessment tool is designed to granularly map out the best locations to place a node within an area of interst
