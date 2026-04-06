@@ -125,6 +125,7 @@ Single click to pan, scroll to zoom, and right click to rotate around terrain
 - Max RSSI is the max of the individual RSSI maps calculated for each node – essentially the maximum signal you could expect to get at any given point
 - Selecting `Color by strongest node` will instead color the map by the color of the node providing the strongest signal to any given point, useful for assessing the contribution of different routers in overlapping areas
 - The RSSI opacity and colormap can be selected using the slider or dropdown respectively
+- In the nodes tab, you can deselect a node to hide it from showing up in RSSI calculations
 
 ### Viewshed Assessment
 ![Viewshed Assessment](images/viewshed_assessment.png)

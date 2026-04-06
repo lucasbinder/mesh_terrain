@@ -106,9 +106,74 @@
     return [previousPrimary, nextId];
   }
 
+  function buildAddNodeInteractionResult(runtime, longitude, latitude, rawName, sourceLabel) {
+    const nodes = (runtime && runtime.nodes ? runtime.nodes : []).slice();
+    const counter = Number((runtime || {}).counter || 0);
+    const selectedNodeIds = runtime && runtime.selectedNodeIds ? runtime.selectedNodeIds : [];
+    const validIds = nodes.map((node) => String(node.id));
+    const name = String(rawName || "").trim();
+    if (!name) {
+      return {
+        clickMode: {mode: "add-node", node_id: null},
+        message: sourceLabel === "manual entry"
+          ? "Node name cannot be empty."
+          : "Node name cannot be empty. Click another map location or disable Click-To-Add.",
+      };
+    }
+
+    const nextCounter = counter + 1;
+    const nextNodeId = `node-${nextCounter}`;
+    const nextNodes = nodes.slice();
+    const normalizedSelectedNodeIds = normalizeSelectedNodeIds(selectedNodeIds, validIds);
+    nextNodes.push({
+      id: nextNodeId,
+      name: name,
+      longitude: Number(longitude),
+      latitude: Number(latitude),
+      height_agl_m: 8.0,
+      antenna_gain_dbi: 6.0,
+      tx_power_dbm: 30.0,
+    });
+    return {
+      nodes: nextNodes,
+      counter: nextCounter,
+      selectedNodeIds: selectPrimaryNode(normalizedSelectedNodeIds, nextNodeId),
+      clickMode: {mode: "none", node_id: null},
+      message: sourceLabel === "manual entry"
+        ? `Added node ${name}.`
+        : `Added node ${name} from native map click.`,
+    };
+  }
+
   function parseMaybeNumber(value) {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function parseCoordinateInputValue(value) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    if (typeof value === "string" && value.trim() === "") {
+      return null;
+    }
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function readInputElementValue(componentId, fallbackValue) {
+    const element = document.getElementById(String(componentId));
+    if (element && "value" in element) {
+      return element.value;
+    }
+    return fallbackValue;
+  }
+
+  function clearInputElementValue(componentId) {
+    const element = document.getElementById(String(componentId));
+    if (element && "value" in element) {
+      element.value = "";
+    }
   }
 
   function formatContextNumber(value, fallback, digits) {
@@ -872,7 +937,6 @@
     const longitude = Number(payload.longitude);
     const latitude = Number(payload.latitude);
     const nodes = (runtime && runtime.nodes ? runtime.nodes : []).slice();
-    const counter = Number((runtime || {}).counter || 0);
     const selectedNodeIds = runtime && runtime.selectedNodeIds ? runtime.selectedNodeIds : [];
     const validIds = nodes.map((node) => String(node.id));
 
@@ -941,33 +1005,7 @@
           message: "Click-to-add canceled. Click another map location or disable Click-To-Add.",
         };
       }
-      const name = String(rawName).trim();
-      if (!name) {
-        return {
-          clickMode: {mode: "add-node", node_id: null},
-          message: "Node name cannot be empty. Click another map location or disable Click-To-Add.",
-        };
-      }
-
-      const nextCounter = counter + 1;
-      const nextNodeId = `node-${nextCounter}`;
-      const nextNodes = nodes.slice();
-      nextNodes.push({
-        id: nextNodeId,
-        name: name,
-        longitude: longitude,
-        latitude: latitude,
-        height_agl_m: 8.0,
-        antenna_gain_dbi: 6.0,
-        tx_power_dbm: 30.0,
-      });
-      return {
-        nodes: nextNodes,
-        counter: nextCounter,
-        selectedNodeIds: selectPrimaryNode(selectedNodeIds, nextNodeId),
-        clickMode: {mode: "none", node_id: null},
-        message: `Added node ${name} from native map click.`,
-      };
+      return buildAddNodeInteractionResult(runtime, longitude, latitude, rawName, "native map click");
     }
 
     return null;
@@ -1565,6 +1603,44 @@
     ];
   }
 
+  function applyManualNodeEntry(nClicks, manualName, manualLon, manualLat, nodes, counter, selectedNodeIds) {
+    const noUpdate = window.dash_clientside.no_update;
+    if (!nClicks) {
+      return [noUpdate, noUpdate, noUpdate, noUpdate];
+    }
+
+    const resolvedName = String(readInputElementValue("manual-node-name", manualName) || "").trim();
+    const longitude = parseCoordinateInputValue(readInputElementValue("manual-node-lon", manualLon));
+    const latitude = parseCoordinateInputValue(readInputElementValue("manual-node-lat", manualLat));
+    if (!resolvedName || longitude === null || latitude === null) {
+      setProp("node-action-message", "children", "Manual node requires name, longitude, and latitude.");
+      return [noUpdate, noUpdate, noUpdate, `manual-node-invalid:${Date.now()}`];
+    }
+
+    const state = getControllerState();
+    state.runtime = {
+      nodes: (nodes || []).slice(),
+      counter: Number(counter || 0),
+      selectedNodeIds: (selectedNodeIds || []).slice(),
+      clickMode: {mode: "add-node", node_id: null},
+    };
+    const result = applyMapInteraction(state.runtime, {
+      longitude: longitude,
+      latitude: latitude,
+      prompt: function () {
+        return resolvedName;
+      },
+    });
+    commitInteractionResult(state, result);
+    clearInputElementValue("manual-node-name");
+    clearInputElementValue("manual-node-lon");
+    clearInputElementValue("manual-node-lat");
+    setProp("manual-node-name", "value", "");
+    setProp("manual-node-lon", "value", null);
+    setProp("manual-node-lat", "value", null);
+    return [noUpdate, noUpdate, noUpdate, `manual-node-added:${Date.now()}`];
+  }
+
   window.__meshTerrainNativeMapTest = {
     applyMapInteraction: applyMapInteraction,
     normalizeSelectedNodeIds: normalizeSelectedNodeIds,
@@ -1575,5 +1651,6 @@
   window.dash_clientside.clientside = Object.assign({}, window.dash_clientside.clientside, {
     renderNativeMap: renderNativeMap,
     startRssiOverlay: startRssiOverlay,
+    applyManualNodeEntry: applyManualNodeEntry,
   });
 })();

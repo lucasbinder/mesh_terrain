@@ -56,6 +56,7 @@ DEFAULT_BBOX = {
 DISPLAY_MAX_DIM = 2400
 DISPLAY_MIN_DIM = 512
 DEFAULT_NODE_HEIGHT_M = 8.0
+DEFAULT_GLOBAL_RX_HEIGHT_M = 2.0
 DEFAULT_FREQ_MHZ = 915.0
 DEFAULT_TX_POWER_DBM = 30.0
 DEFAULT_TX_GAIN_DBI = 6.0
@@ -1084,7 +1085,7 @@ def compute_native_map_path_overlay(nodes, selected_node_ids, point_path_data, b
                 (source["longitude"], source["latitude"]),
                 (float(target_lon), float(target_lat)),
                 tx_height=source["height_agl_m"],
-                rx_height=float(global_rx_height_agl or DEFAULT_NODE_HEIGHT_M),
+                rx_height=float(global_rx_height_agl or DEFAULT_GLOBAL_RX_HEIGHT_M),
                 tx_power_dbm=source["tx_power_dbm"],
                 tx_gain_dbi=source["antenna_gain_dbi"],
                 rx_gain_dbi=float(global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI),
@@ -2928,7 +2929,7 @@ def get_enabled_rssi_overlay_entries(bundle, nodes, calculation_store, overlay_s
         return []
 
     include_ground_loss = bool(calculation_store.get("include_ground_loss", False))
-    rx_height = float(calculation_store.get("global_rx_height_agl", DEFAULT_NODE_HEIGHT_M))
+    rx_height = float(calculation_store.get("global_rx_height_agl", DEFAULT_GLOBAL_RX_HEIGHT_M))
     rx_gain = float(calculation_store.get("global_rx_gain_dbi", DEFAULT_RX_GAIN_DBI))
 
     for node_id in enabled_node_ids:
@@ -3425,6 +3426,7 @@ def build_node_summary(nodes, selected_node_ids, overlay_selection_store):
                     "paddingBottom": "10px" if is_selected else "0",
                     "paddingTop": "2px",
                 },
+                key=f"node-card-{str(node['id'])}",
             )
         )
 
@@ -3513,6 +3515,8 @@ app.layout = [
     dcc.Store(id="nodes-store", data=[]),
     dcc.Store(id="node-counter-store", data=0),
     dcc.Store(id="selected-node-ids-store", data=[]),
+    dcc.Store(id="node-delete-request-store", data=None),
+    dcc.Store(id="manual-node-entry-ack-store", data=None),
     dcc.Store(id="node-upload-reset-store", data=0),
     dcc.Store(id="map-click-mode-store", data={"mode": "none", "node_id": None}),
     dcc.Store(id="map-camera-store", data=DEFAULT_BBOX),
@@ -3678,7 +3682,7 @@ app.layout = [
                                     html.Div("RSSI overlay opacity", style={"fontWeight": "600", "marginTop": "8px"}),
                                     dcc.Slider(0, 1, step=0.05, value=0.55, id="rssi-opacity", updatemode="mouseup"),
                                     html.Div("Global RX Height AGL (m)", style={"fontWeight": "600"}),
-                                    dcc.Input(id="global-rx-height-agl", type="number", value=DEFAULT_NODE_HEIGHT_M, style={"width": "100%"}),
+                                    dcc.Input(id="global-rx-height-agl", type="number", value=DEFAULT_GLOBAL_RX_HEIGHT_M, style={"width": "100%"}),
                                     html.Div("Global RX Antenna Gain (dBi)", style={"fontWeight": "600"}),
                                     dcc.Input(id="global-rx-gain-dbi", type="number", value=DEFAULT_RX_GAIN_DBI, style={"width": "100%"}),
                                     html.Div("Max RSSI colormap", style={"fontWeight": "600", "marginTop": "8px"}),
@@ -4431,21 +4435,47 @@ def update_point_path_button(selected_node_ids, nodes):
 
 
 @app.callback(
+    Output("node-delete-request-store", "data"),
+    Input({"type": "delete-node-button", "node_id": ALL}, "n_clicks_timestamp"),
+    State({"type": "delete-node-button", "node_id": ALL}, "id"),
+    State("node-delete-request-store", "data"),
+    prevent_initial_call=True,
+)
+def capture_node_delete_request(_timestamps, button_ids, current_request):
+    timestamps = _timestamps or []
+    button_ids = button_ids or []
+    latest_timestamp = int((current_request or {}).get("timestamp") or -1)
+    next_request = None
+
+    for button_id, timestamp in zip(button_ids, timestamps, strict=False):
+        if timestamp is None:
+            continue
+        timestamp = int(timestamp)
+        if timestamp <= latest_timestamp:
+            continue
+        next_request = {
+            "node_id": str(button_id.get("node_id")),
+            "timestamp": timestamp,
+        }
+
+    if next_request is None:
+        raise PreventUpdate
+    return next_request
+
+
+@app.callback(
     Output("nodes-store", "data", allow_duplicate=True),
     Output("node-action-message", "children", allow_duplicate=True),
     Output("map-click-mode-store", "data", allow_duplicate=True),
-    Input({"type": "delete-node-button", "node_id": ALL}, "n_clicks"),
+    Input("node-delete-request-store", "data"),
     State("nodes-store", "data"),
     prevent_initial_call=True,
 )
-def delete_node(_n_clicks, nodes):
-    triggered = ctx.triggered_id
-    if not triggered or "node_id" not in triggered:
-        raise PreventUpdate
-    if not ctx.triggered or not ctx.triggered[0].get("value"):
+def delete_node(delete_request, nodes):
+    if not delete_request or "node_id" not in delete_request:
         raise PreventUpdate
 
-    node_id = str(triggered["node_id"])
+    node_id = str(delete_request["node_id"])
     updated_nodes = [node for node in (nodes or []) if str(node["id"]) != node_id]
     if len(updated_nodes) == len(nodes or []):
         raise PreventUpdate
@@ -4597,12 +4627,8 @@ def update_rssi_overlay_selection(_values, selection_store):
     Output("manual-node-lon", "value"),
     Output("manual-node-lat", "value"),
     Output("node-action-message", "children"),
-    Input("add-manual-node", "n_clicks"),
     Input("node-upload", "contents"),
     State("node-upload", "filename"),
-    State("manual-node-name", "value"),
-    State("manual-node-lon", "value"),
-    State("manual-node-lat", "value"),
     State("nodes-store", "data"),
     State("node-counter-store", "data"),
     State("selected-node-ids-store", "data"),
@@ -4612,12 +4638,8 @@ def update_rssi_overlay_selection(_values, selection_store):
     prevent_initial_call=True,
 )
 def manage_nodes(
-    _add_manual_clicks,
     upload_contents,
     upload_filename,
-    manual_name,
-    manual_lon,
-    manual_lat,
     nodes,
     counter,
     selected_node_ids,
@@ -4627,113 +4649,56 @@ def manage_nodes(
 ):
     nodes = list(nodes or [])
     counter = int(counter or 0)
-    trigger = ctx.triggered_id
-
-    if trigger == "node-upload":
-        if not upload_contents:
-            raise PreventUpdate
-        try:
-            frame = parse_uploaded_nodes(upload_contents)
-        except Exception as exc:
-            return (
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                f"CSV load failed: {exc}",
-            )
-        loaded_nodes = [with_node_defaults(node) for node in nodes]
-        last_loaded_id = None
-        for row in frame.itertuples(index=False):
-            counter += 1
-            last_loaded_id = f"node-{counter}"
-            loaded_nodes.append(
-                {
-                    "id": last_loaded_id,
-                    "name": str(row.name),
-                    "longitude": float(row.longitude),
-                    "latitude": float(row.latitude),
-                    "height_agl_m": float(row.height_agl_m),
-                    "antenna_gain_dbi": float(row.antenna_gain_dbi),
-                    "tx_power_dbm": float(row.tx_power_dbm),
-                }
-            )
-        message = f"Loaded {len(frame)} nodes from {upload_filename or 'CSV'}."
-        next_selected = select_primary_node(selected_node_ids, last_loaded_id) if last_loaded_id is not None else (selected_node_ids or [])
-        next_view = fit_bbox_for_nodes(loaded_nodes) or current_map_view or DEFAULT_BBOX
+    if not upload_contents:
+        raise PreventUpdate
+    try:
+        frame = parse_uploaded_nodes(upload_contents)
+    except Exception as exc:
         return (
-            loaded_nodes,
-            counter,
-            next_selected,
-            next_view,
-            next_view,
-            next_revision(camera_revision),
-            next_revision(node_upload_reset_revision),
-            "",
-            None,
-            None,
-            message,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            no_update,
+            f"CSV load failed: {exc}",
         )
-
-    if trigger == "add-manual-node":
-        if not manual_name or manual_lon is None or manual_lat is None:
-            return (
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                "Manual node requires name, longitude, and latitude.",
-            )
+    loaded_nodes = [with_node_defaults(node) for node in nodes]
+    last_loaded_id = None
+    for row in frame.itertuples(index=False):
         counter += 1
-        node_id = f"node-{counter}"
-        nodes.append(
+        last_loaded_id = f"node-{counter}"
+        loaded_nodes.append(
             {
-                "id": node_id,
-                "name": str(manual_name),
-                "longitude": float(manual_lon),
-                "latitude": float(manual_lat),
-                "height_agl_m": DEFAULT_NODE_HEIGHT_M,
-                "antenna_gain_dbi": DEFAULT_TX_GAIN_DBI,
-                "tx_power_dbm": DEFAULT_TX_POWER_DBM,
+                "id": last_loaded_id,
+                "name": str(row.name),
+                "longitude": float(row.longitude),
+                "latitude": float(row.latitude),
+                "height_agl_m": float(row.height_agl_m),
+                "antenna_gain_dbi": float(row.antenna_gain_dbi),
+                "tx_power_dbm": float(row.tx_power_dbm),
             }
         )
-        message = f"Added node {manual_name}."
-        current_view = current_map_view or DEFAULT_BBOX
-        next_view = no_update
-        next_camera = no_update
-        next_camera_revision = no_update
-        if not point_in_bbox(float(manual_lon), float(manual_lat), current_view):
-            fitted_view = fit_bbox_for_nodes(nodes) or current_view
-            next_view = fitted_view
-            next_camera = fitted_view
-            next_camera_revision = next_revision(camera_revision)
-        return (
-            nodes,
-            counter,
-            select_primary_node(selected_node_ids, node_id),
-            next_camera,
-            next_view,
-            next_camera_revision,
-            no_update,
-            "",
-            None,
-            None,
-            message,
-        )
-
-    raise PreventUpdate
+    message = f"Loaded {len(frame)} nodes from {upload_filename or 'CSV'}."
+    next_selected = select_primary_node(selected_node_ids, last_loaded_id) if last_loaded_id is not None else (selected_node_ids or [])
+    next_view = fit_bbox_for_nodes(loaded_nodes) or current_map_view or DEFAULT_BBOX
+    return (
+        loaded_nodes,
+        counter,
+        next_selected,
+        next_view,
+        next_view,
+        next_revision(camera_revision),
+        next_revision(node_upload_reset_revision),
+        "",
+        None,
+        None,
+        message,
+    )
 
 
 @app.callback(
@@ -4979,6 +4944,22 @@ app.clientside_callback(
     Input("map-click-mode-store", "data"),
     State("viewshed-point-store", "data"),
     State("viewshed-assessment-store", "data"),
+)
+
+app.clientside_callback(
+    ClientsideFunction(namespace="clientside", function_name="applyManualNodeEntry"),
+    Output("manual-node-name", "value", allow_duplicate=True),
+    Output("manual-node-lon", "value", allow_duplicate=True),
+    Output("manual-node-lat", "value", allow_duplicate=True),
+    Output("manual-node-entry-ack-store", "data", allow_duplicate=True),
+    Input("add-manual-node", "n_clicks"),
+    State("manual-node-name", "value"),
+    State("manual-node-lon", "value"),
+    State("manual-node-lat", "value"),
+    State("nodes-store", "data"),
+    State("node-counter-store", "data"),
+    State("selected-node-ids-store", "data"),
+    prevent_initial_call=True,
 )
 
 @app.callback(
@@ -5286,7 +5267,7 @@ def generate_rssi_overlay(
     )
     bundle = get_map_bundle(*bbox)
     include_ground_loss = "enabled" in (include_rssi_ground_loss or [])
-    rx_height = global_rx_height_agl or DEFAULT_NODE_HEIGHT_M
+    rx_height = global_rx_height_agl or DEFAULT_GLOBAL_RX_HEIGHT_M
     rx_gain = global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI
     node_overlay_keys = {}
     node_signatures = {}
@@ -5446,7 +5427,7 @@ def update_path_profile(point_path_data, selected_node_ids, nodes, bbox_data, gl
                 (source["longitude"], source["latitude"]),
                 (float(target_lon), float(target_lat)),
                 tx_height=source["height_agl_m"],
-                rx_height=float(global_rx_height_agl or DEFAULT_NODE_HEIGHT_M),
+                rx_height=float(global_rx_height_agl or DEFAULT_GLOBAL_RX_HEIGHT_M),
                 tx_power_dbm=source["tx_power_dbm"],
                 tx_gain_dbi=source["antenna_gain_dbi"],
                 rx_gain_dbi=float(global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI),
@@ -5465,7 +5446,7 @@ def update_path_profile(point_path_data, selected_node_ids, nodes, bbox_data, gl
                     f"{source['antenna_gain_dbi']:.1f} dBi / {source['tx_power_dbm']:.1f} dBm"
                 ),
                 (
-                    f"Global RX height/gain: {float(global_rx_height_agl or DEFAULT_NODE_HEIGHT_M):.1f} m / "
+                    f"Global RX height/gain: {float(global_rx_height_agl or DEFAULT_GLOBAL_RX_HEIGHT_M):.1f} m / "
                     f"{float(global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI):.1f} dBi"
                 ),
             ]
