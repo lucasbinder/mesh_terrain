@@ -3,6 +3,7 @@ import base64
 import hashlib
 import io
 import json
+import logging
 import math
 import threading
 import warnings
@@ -171,6 +172,11 @@ RSSI_OVERLAY_CACHE = {}
 VIEWSHED_ASSESSMENT_CACHE = {}
 TERRAIN_DEM_TOKENS = {}
 DESKTOP_NOTIFIER = DesktopNotifier(app_name="Mesh Terrain") if DesktopNotifier is not None else None
+
+
+class SuppressReloadHashFilter(logging.Filter):
+    def filter(self, record):
+        return "GET /_reload-hash" not in record.getMessage()
 
 
 def node_signature(node):
@@ -3482,7 +3488,17 @@ app = Dash(
     external_scripts=[MAPLIBRE_JS_URL],
     external_stylesheets=[MAPLIBRE_CSS_URL],
 )
+app.enable_dev_tools(
+    debug=False,
+    dev_tools_ui=False,
+    dev_tools_serve_dev_bundles=False,
+    dev_tools_hot_reload=False,
+)
 app.title = "Non Flatlander Mesh Terrain Planner (NF-MTP)"
+
+werkzeug_logger = logging.getLogger("werkzeug")
+if not any(isinstance(existing_filter, SuppressReloadHashFilter) for existing_filter in werkzeug_logger.filters):
+    werkzeug_logger.addFilter(SuppressReloadHashFilter())
 
 
 @app.server.route("/terrain-dem/<token>/<int:z>/<int:x>/<int:y>.png")
@@ -3552,6 +3568,13 @@ app.layout = [
                                         "Terrain-driven controls unlock after the first successful terrain load.",
                                         style={"fontSize": "12px", "color": "#94a3b8"},
                                     ),
+                                    html.Div("Base map style", style={"fontWeight": "600", "marginTop": "8px"}),
+                                    dcc.Dropdown(
+                                        id="base-map-style",
+                                        options=BASE_MAP_STYLE_OPTIONS,
+                                        value="satellite",
+                                        clearable=False,
+                                    ),
                                     html.Div("Terrain overlay alpha", style={"fontWeight": "600", "marginTop": "4px"}),
                                     dcc.Slider(0, 1, step=0.05, value=0.45, id="elevation_alpha", disabled=True, updatemode="mouseup"),
                                     html.Div("Terrain elevation clipping range (m)", style={"fontWeight": "600", "marginTop": "4px"}),
@@ -3571,17 +3594,11 @@ app.layout = [
                                         style={"width": "100%"},
                                         disabled=True,
                                     ),
-                                    html.Div("Base map style", style={"fontWeight": "600", "marginTop": "8px"}),
-                                    dcc.Dropdown(
-                                        id="base-map-style",
-                                        options=BASE_MAP_STYLE_OPTIONS,
-                                        value="satellite",
-                                        clearable=False,
-                                    ),
                                     html.Div("Elevation colormap", style={"fontWeight": "600", "marginTop": "8px"}),
                                     dcc.Dropdown(
                                         id="elevation-colormap",
-                                        options=[{"label": value, "value": value} for value in ELEVATION_COLOR_SCALE_OPTIONS],
+                                        options=[{"label": value, "value": value} for value in
+                                                 ELEVATION_COLOR_SCALE_OPTIONS],
                                         value="Magma",
                                         clearable=False,
                                     ),
@@ -5512,4 +5529,4 @@ def update_path_profile(point_path_data, selected_node_ids, nodes, bbox_data, gl
 
 
 if __name__ == "__main__":
-    app.run(debug=False)
+    app.run(debug=False, dev_tools_hot_reload=False, use_reloader=False)
