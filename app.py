@@ -1,7 +1,10 @@
+import asyncio
 import base64
 import hashlib
 import io
+import json
 import math
+import threading
 import warnings
 from contextlib import contextmanager
 from functools import lru_cache
@@ -21,7 +24,13 @@ from plotly.colors import qualitative, sample_colorscale
 from rasterio.errors import NotGeoreferencedWarning
 from rasterio.io import MemoryFile
 from rasterio.warp import Resampling, reproject, transform, transform_bounds
+from scipy.interpolate import RBFInterpolator
 from xrspatial import viewshed
+
+try:
+    from desktop_notifier import DesktopNotifier
+except ModuleNotFoundError:
+    DesktopNotifier = None
 
 PROJECTED_CRS = "EPSG:26912"  # NAD83 / UTM zone 12N, suitable for Utah
 GEOGRAPHIC_CRS = "EPSG:4326"
@@ -43,8 +52,8 @@ DEFAULT_BBOX = {
     "max_lat": 42.65,
 }
 
-DISPLAY_WIDTH = 1920
-DISPLAY_HEIGHT = 2400
+DISPLAY_MAX_DIM = 2400
+DISPLAY_MIN_DIM = 512
 DEFAULT_NODE_HEIGHT_M = 8.0
 DEFAULT_FREQ_MHZ = 915.0
 DEFAULT_TX_POWER_DBM = 30.0
@@ -52,6 +61,19 @@ DEFAULT_TX_GAIN_DBI = 6.0
 DEFAULT_RX_GAIN_DBI = 2.0
 DEFAULT_OTHER_LOSSES_DB = 3.0
 MIN_LINK_RSSI_DBM = -140.0
+VIEWSHED_ASSESSMENT_RADIUS_M = 100.0
+VIEWSHED_ASSESSMENT_OBSERVER_HEIGHT_AGL_M = 0.0
+VIEWSHED_ASSESSMENT_MAX_SAMPLES = 160
+VIEWSHED_ASSESSMENT_TARGET_RESOLUTION_M = 1.0
+VIEWSHED_ASSESSMENT_MIN_DIM = 64
+VIEWSHED_ASSESSMENT_MAX_DIM = 128
+VIEWSHED_ASSESSMENT_METRIC_VERSION = "global-visible-cell-count-v4-circular-rbf"
+VIEWSHED_SAMPLE_COUNT_OPTIONS = [7, 19, 37, 61, 91, 127]
+DEFAULT_VIEWSHED_SAMPLE_COUNT = 37
+VIEWSHED_COLOR_SCALE_OPTIONS = ["Turbo", "Viridis", "Magma", "Inferno", "Cividis", "Plasma"]
+VIEWSHED_POINT_COLOR = "#ef4444"
+VIEWSHED_POINT_OUTLINE_COLOR = "#ffffff"
+VIEWSHED_LEGEND_TITLE = "Visible Cells"
 
 COLOR_SEQUENCE = qualitative.Dark24 + qualitative.Bold + qualitative.Safe + qualitative.Set3
 ELEVATION_COLOR_SCALE_OPTIONS = ["Magma", "Viridis", "Cividis", "Inferno", "Plasma", "Greys"]
@@ -66,6 +88,32 @@ PATH_PREVIEW_COLOR = "#38bdf8"
 ATTENUATION_EVENT_COLOR = "#f97316"
 ATTENUATION_EVENT_EDGE_COLOR = "#7c2d12"
 TERRAIN_BLOCK_COLOR = "#a855f7"
+WORLDCOVER_CLASSES = {
+    10: "Tree cover",
+    20: "Shrubland",
+    30: "Grassland",
+    40: "Cropland",
+    50: "Built-up",
+    60: "Bare / sparse vegetation",
+    70: "Snow and ice",
+    80: "Permanent water bodies",
+    90: "Herbaceous wetland",
+    95: "Mangroves",
+    100: "Moss and lichen",
+}
+WORLDCOVER_PALETTE = {
+    10: "#006400",
+    20: "#ffbb22",
+    30: "#ffff4c",
+    40: "#f096ff",
+    50: "#fa0000",
+    60: "#b4b4b4",
+    70: "#f0f0f0",
+    80: "#0064c8",
+    90: "#0096a0",
+    95: "#00cf75",
+    100: "#fae6a0",
+}
 MAPLIBRE_VERSION = "5.16.0"
 MAPLIBRE_JS_URL = f"https://unpkg.com/maplibre-gl@{MAPLIBRE_VERSION}/dist/maplibre-gl.js"
 MAPLIBRE_CSS_URL = f"https://unpkg.com/maplibre-gl@{MAPLIBRE_VERSION}/dist/maplibre-gl.css"
@@ -75,7 +123,7 @@ TERRAIN_MAX_ZOOM = 15
 DEFAULT_TERRAIN_EXAGGERATION = 1.0
 DEFAULT_3D_PITCH = 60.0
 DEFAULT_3D_BEARING = 20.0
-DEFAULT_MAP_LOADING_MESSAGE = "Updating map..."
+DEFAULT_MAP_LOADING_MESSAGE = "Loading Terrain and WorldCover Data..."
 RSSI_MAP_LOADING_MESSAGE = "Performing RSSI and LOS Calculations"
 RSSI_RENDER_MODE_OPTIONS = [
     {"label": "Show max RSSI", "value": "max-rssi"},
@@ -120,7 +168,9 @@ V_ATTENUATION = np.vectorize(lambda value: ATTENUATION.get(int(value), 0), otype
 ANALYSIS_CONTEXT = {}
 ANALYSIS_KEY = None
 RSSI_OVERLAY_CACHE = {}
+VIEWSHED_ASSESSMENT_CACHE = {}
 TERRAIN_DEM_TOKENS = {}
+DESKTOP_NOTIFIER = DesktopNotifier(app_name="Mesh Terrain") if DesktopNotifier is not None else None
 
 
 def node_signature(node):
@@ -153,14 +203,110 @@ def point_path_signature(point_path_data):
     )
 
 
-def native_map_overlay_context_key(nodes, selected_node_ids=None, point_path_data=None):
+def viewshed_point_signature(point_data):
+    if not point_data:
+        return "viewshed:none"
+    longitude = point_data.get("longitude")
+    latitude = point_data.get("latitude")
+    if longitude is None or latitude is None:
+        return "viewshed:invalid"
+    return f"viewshed:{float(longitude):.6f}:{float(latitude):.6f}"
+
+
+def viewshed_assessment_signature(assessment_store):
+    if not assessment_store:
+        return "viewshed-assessment:none"
+    cache_key = assessment_store.get("cache_key")
+    if cache_key:
+        return f"viewshed-assessment:{cache_key}"
+    return "viewshed-assessment:pending"
+
+
+def native_map_overlay_context_key(
+    nodes,
+    selected_node_ids=None,
+    point_path_data=None,
+    viewshed_point_data=None,
+    viewshed_assessment_store=None,
+):
     normalized_nodes = [with_node_defaults(node) for node in (nodes or [])]
     selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in normalized_nodes])
     parts = ["nodes"]
     parts.extend(node_signature(node) for node in normalized_nodes)
     parts.append("selected:" + ",".join(str(node_id) for node_id in selected_node_ids))
     parts.append(point_path_signature(point_path_data))
+    parts.append(viewshed_point_signature(viewshed_point_data))
+    parts.append(viewshed_assessment_signature(viewshed_assessment_store))
     return "||".join(parts)
+
+
+def normalize_visual_context_value(value):
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, dict):
+        return {
+            str(key): normalize_visual_context_value(item)
+            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [normalize_visual_context_value(item) for item in value]
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        return round(float(value), 6)
+    if isinstance(value, (int, str, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def normalized_context_bbox(bbox_data):
+    if not bbox_data:
+        return None
+    min_lon, min_lat, max_lon, max_lat = normalize_bbox(
+        bbox_data["min_lon"],
+        bbox_data["min_lat"],
+        bbox_data["max_lon"],
+        bbox_data["max_lat"],
+    )
+    return {
+        "min_lon": round(float(min_lon), 6),
+        "min_lat": round(float(min_lat), 6),
+        "max_lon": round(float(max_lon), 6),
+        "max_lat": round(float(max_lat), 6),
+    }
+
+
+def native_map_visual_context_key(
+    bbox_data,
+    terrain_alpha,
+    terrain_clip_range,
+    worldcover_display,
+    worldcover_opacity,
+    base_map_style,
+    elevation_colormap,
+    rssi_calculation_store,
+    rssi_overlay_selection_store,
+    rssi_opacity,
+    rssi_colormap,
+    rssi_render_mode,
+    viewshed_visual_settings=None,
+):
+    payload = {
+        "bbox": normalized_context_bbox(bbox_data),
+        "terrain_alpha": normalize_visual_context_value(terrain_alpha),
+        "terrain_clip_range": normalize_visual_context_value(terrain_clip_range),
+        "worldcover_enabled": "enabled" in (worldcover_display or []),
+        "worldcover_opacity": normalize_visual_context_value(worldcover_opacity),
+        "base_map_style": str(base_map_style or "satellite"),
+        "elevation_colormap": str(elevation_colormap or "Magma"),
+        "rssi_calculation_store": normalize_visual_context_value(rssi_calculation_store),
+        "rssi_overlay_selection_store": normalize_visual_context_value(rssi_overlay_selection_store or {}),
+        "rssi_opacity": normalize_visual_context_value(rssi_opacity),
+        "rssi_colormap": str(rssi_colormap or "Turbo"),
+        "rssi_render_mode": str(rssi_render_mode or "max-rssi"),
+        "viewshed_visual_settings": normalize_visual_context_value(viewshed_visual_settings or {}),
+    }
+    return json.dumps(payload, separators=(",", ":"))
 
 
 def fetch_image_href(meta_url):
@@ -362,16 +508,41 @@ def choose_osm_zoom(min_lon, min_lat, max_lon, max_lat):
     return OSM_MIN_ZOOM
 
 
-def geographic_bbox_to_pixel_shape(min_lon, min_lat, max_lon, max_lat, max_dim=1600):
-    lon_span = max(float(max_lon) - float(min_lon), 1e-6)
-    lat_span = max(float(max_lat) - float(min_lat), 1e-6)
-    if lon_span >= lat_span:
-        width = max_dim
-        height = max(512, int(round(max_dim * lat_span / lon_span)))
+def extent_to_pixel_shape(min_x, min_y, max_x, max_y, max_dim=DISPLAY_MAX_DIM, min_dim=DISPLAY_MIN_DIM):
+    x_span = max(float(max_x) - float(min_x), 1e-6)
+    y_span = max(float(max_y) - float(min_y), 1e-6)
+    if x_span >= y_span:
+        width = int(max_dim)
+        height = max(int(min_dim), int(round(float(max_dim) * y_span / x_span)))
     else:
-        height = max_dim
-        width = max(512, int(round(max_dim * lon_span / lat_span)))
+        height = int(max_dim)
+        width = max(int(min_dim), int(round(float(max_dim) * x_span / y_span)))
     return width, height
+
+
+def geographic_bbox_to_pixel_shape(min_lon, min_lat, max_lon, max_lat, max_dim=DISPLAY_MAX_DIM, min_dim=DISPLAY_MIN_DIM):
+    return extent_to_pixel_shape(min_lon, min_lat, max_lon, max_lat, max_dim=max_dim, min_dim=min_dim)
+
+
+def span_to_sample_dim(span_m, target_resolution_m, min_dim, max_dim):
+    target_resolution_m = max(float(target_resolution_m), 1e-6)
+    sample_dim = int(math.ceil(float(span_m) / target_resolution_m))
+    return int(np.clip(sample_dim, int(min_dim), int(max_dim)))
+
+
+def elevation_export_image_href(min_x, min_y, max_x, max_y, crs, width, height):
+    meta_url = (
+        "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
+        f"?bbox={float(min_x)},{float(min_y)},{float(max_x)},{float(max_y)}"
+        f"&bboxSR={str(crs).split(':')[-1]}"
+        f"&imageSR={str(crs).split(':')[-1]}"
+        f"&size={int(width)},{int(height)}"
+        "&format=tiff"
+        "&pixelType=F32"
+        "&interpolation=RSP_BilinearInterpolation"
+        "&f=json"
+    )
+    return fetch_image_href(meta_url)
 
 
 def raster_layer_coordinates(bbox_data):
@@ -474,7 +645,7 @@ def build_discrete_legend_card(title, items):
     )
 
 
-def build_native_map_legends(terrain_legend=None, rssi_legend=None):
+def build_native_map_legends(terrain_legend=None, worldcover_legend=None, rssi_legend=None, viewshed_legend=None):
     cards = []
     if terrain_legend is not None:
         cards.append(
@@ -483,6 +654,13 @@ def build_native_map_legends(terrain_legend=None, rssi_legend=None):
                 terrain_legend["colorscale"],
                 terrain_legend["min"],
                 terrain_legend["max"],
+            )
+        )
+    if worldcover_legend is not None:
+        cards.append(
+            build_discrete_legend_card(
+                str(worldcover_legend.get("title") or "WorldCover"),
+                worldcover_legend.get("items") or [],
             )
         )
     if rssi_legend is not None:
@@ -502,9 +680,23 @@ def build_native_map_legends(terrain_legend=None, rssi_legend=None):
                     rssi_legend["max"],
                 )
             )
+    if viewshed_legend is not None:
+        cards.append(
+            build_gradient_legend_card(
+                str(viewshed_legend.get("title") or VIEWSHED_LEGEND_TITLE),
+                viewshed_legend["colorscale"],
+                viewshed_legend["min"],
+                viewshed_legend["max"],
+            )
+        )
     if not cards:
         return html.Div()
-    return html.Div(cards, className="native-map-legend-stack")
+    stack_class = (
+        "native-map-legend-stack native-map-legend-stack--bottom-right"
+        if worldcover_legend is not None or viewshed_legend is not None
+        else "native-map-legend-stack"
+    )
+    return html.Div(cards, className=stack_class)
 
 
 def build_node_feature_collection(nodes, selected_node_ids):
@@ -528,6 +720,125 @@ def build_node_feature_collection(nodes, selected_node_ids):
                     "color": node_color(index),
                     "outline_color": outline_colors[index],
                     "outline_width": float(outline_widths[index]),
+                },
+            }
+        )
+    return feature_collection(features)
+
+
+def build_viewshed_point_feature_collection(point_data):
+    if not point_data:
+        return feature_collection()
+    longitude = point_data.get("longitude")
+    latitude = point_data.get("latitude")
+    if longitude is None or latitude is None:
+        return feature_collection()
+    return feature_collection(
+        [
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [float(longitude), float(latitude)],
+                },
+                "properties": {
+                    "kind": "viewshed-point",
+                    "name": "Viewshed Assessment Point",
+                    "color": VIEWSHED_POINT_COLOR,
+                    "outline_color": VIEWSHED_POINT_OUTLINE_COLOR,
+                },
+            }
+        ]
+    )
+
+
+def build_viewshed_radius_feature_collection(point_data, radius_m, segments=96):
+    if not point_data:
+        return feature_collection()
+    longitude = point_data.get("longitude")
+    latitude = point_data.get("latitude")
+    if longitude is None or latitude is None:
+        return feature_collection()
+    radius_m = float(radius_m or 0.0)
+    if radius_m <= 0.0:
+        return feature_collection()
+
+    center_x, center_y = transform(
+        GEOGRAPHIC_CRS,
+        PROJECTED_CRS,
+        [float(longitude)],
+        [float(latitude)],
+    )
+    center_x = float(center_x[0])
+    center_y = float(center_y[0])
+    ring_angles = np.linspace(0.0, 2.0 * math.pi, int(max(12, segments)) + 1, dtype=np.float64)
+    ring_x = center_x + radius_m * np.cos(ring_angles)
+    ring_y = center_y + radius_m * np.sin(ring_angles)
+    ring_lon, ring_lat = transform(
+        PROJECTED_CRS,
+        GEOGRAPHIC_CRS,
+        ring_x.tolist(),
+        ring_y.tolist(),
+    )
+    coordinates = [[float(lon), float(lat)] for lon, lat in zip(ring_lon, ring_lat, strict=False)]
+    return feature_collection(
+        [
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": coordinates,
+                },
+                "properties": {
+                    "kind": "viewshed-radius",
+                    "radius_m": radius_m,
+                    "color": VIEWSHED_POINT_COLOR,
+                    "outline_color": VIEWSHED_POINT_OUTLINE_COLOR,
+                },
+            }
+        ]
+    )
+
+
+def build_viewshed_sample_feature_collection(point_data, radius_m, sample_count):
+    if not point_data:
+        return feature_collection()
+    longitude = point_data.get("longitude")
+    latitude = point_data.get("latitude")
+    if longitude is None or latitude is None:
+        return feature_collection()
+    radius_m = float(radius_m or 0.0)
+    sample_count = effective_viewshed_sample_count(sample_count)
+    if radius_m <= 0.0 or sample_count <= 0:
+        return feature_collection()
+
+    center_x, center_y = transform(
+        GEOGRAPHIC_CRS,
+        PROJECTED_CRS,
+        [float(longitude)],
+        [float(latitude)],
+    )
+    sample_points = generate_circular_samples(float(center_x[0]), float(center_y[0]), radius_m, sample_count)
+    sample_lon, sample_lat = transform(
+        PROJECTED_CRS,
+        GEOGRAPHIC_CRS,
+        sample_points[:, 0].tolist(),
+        sample_points[:, 1].tolist(),
+    )
+    features = []
+    for sample_index, (sample_lon_value, sample_lat_value) in enumerate(zip(sample_lon, sample_lat, strict=False)):
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [float(sample_lon_value), float(sample_lat_value)],
+                },
+                "properties": {
+                    "kind": "viewshed-sample",
+                    "index": int(sample_index),
+                    "color": VIEWSHED_POINT_COLOR,
+                    "outline_color": VIEWSHED_POINT_OUTLINE_COLOR,
                 },
             }
         )
@@ -575,7 +886,8 @@ def sample_grid_value(values, lon_axis, lat_axis, longitude, latitude):
     return sample
 
 
-def build_native_path_line_feature(start_lon, start_lat, end_lon, end_lat, color, dashed=False):
+def build_native_path_line_feature(start_lon, start_lat, end_lon, end_lat, color, dashed=False, result=None):
+    _ = result
     return {
         "type": "Feature",
         "geometry": {
@@ -600,7 +912,7 @@ def empty_native_path_overlay():
 
 def build_native_path_overlay(start_lon, start_lat, end_lon, end_lat, color, dashed=False, result=None):
     line = feature_collection(
-        [build_native_path_line_feature(start_lon, start_lat, end_lon, end_lat, color, dashed=dashed)]
+        [build_native_path_line_feature(start_lon, start_lat, end_lon, end_lat, color, dashed=dashed, result=result)]
     )
     if result is None:
         attenuation_points = feature_collection()
@@ -638,6 +950,29 @@ def build_path_sample_fractions(result):
     return np.linspace(0.0, 1.0, path_longitude.size, dtype=np.float64)
 
 
+def path_coordinate_arrays(result, start_lon, start_lat, end_lon, end_lat):
+    if result is not None:
+        path_longitude = np.asarray(result.get("path_longitude", []), dtype=np.float64)
+        path_latitude = np.asarray(result.get("path_latitude", []), dtype=np.float64)
+        if path_longitude.size >= 2 and path_longitude.size == path_latitude.size:
+            return path_longitude, path_latitude
+
+    path_fraction = build_path_sample_fractions(result or {})
+    if path_fraction.size:
+        return interpolate_path_coordinates(
+            start_lon,
+            start_lat,
+            end_lon,
+            end_lat,
+            path_fraction,
+        )
+
+    return (
+        np.asarray([float(start_lon), float(end_lon)], dtype=np.float64),
+        np.asarray([float(start_lat), float(end_lat)], dtype=np.float64),
+    )
+
+
 def interpolate_path_coordinates(start_lon, start_lat, end_lon, end_lat, fractions):
     fractions = np.asarray(fractions, dtype=np.float64)
     if fractions.size == 0:
@@ -657,7 +992,16 @@ def build_native_path_event_feature_collections(result, start_lon, start_lat, en
     terrain_block_features = []
     if path_fraction.size == 0:
         return feature_collection(), feature_collection()
-    path_longitude, path_latitude = interpolate_path_coordinates(
+    path_longitude, path_latitude = path_coordinate_arrays(
+        result,
+        start_lon,
+        start_lat,
+        end_lon,
+        end_lat,
+    )
+    if path_longitude.size != path_fraction.size or path_latitude.size != path_fraction.size:
+        return feature_collection(), feature_collection()
+    line_longitude, line_latitude = interpolate_path_coordinates(
         start_lon,
         start_lat,
         end_lon,
@@ -666,42 +1010,40 @@ def build_native_path_event_feature_collections(result, start_lon, start_lat, en
     )
 
     attenuation_mask = (blockage_fraction > 0) & ~terrain_only_blocked
-    for longitude, latitude, blocked_fraction, added_loss_db in zip(
-        path_longitude[attenuation_mask],
-        path_latitude[attenuation_mask],
-        blockage_fraction[attenuation_mask],
-        attenuation_per_sample_db[attenuation_mask],
-        strict=False,
-    ):
+    for sample_index in np.flatnonzero(attenuation_mask):
+        blocked_fraction = blockage_fraction[sample_index]
+        added_loss_db = attenuation_per_sample_db[sample_index]
         attenuation_features.append(
             {
                 "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [float(longitude), float(latitude)]},
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [float(path_longitude[sample_index]), float(path_latitude[sample_index])],
+                },
                 "properties": {
                     "kind": "attenuation-event",
                     "blocked_fraction": float(blocked_fraction),
                     "added_loss_db": float(added_loss_db),
-                    "sample_fraction": float(path_fraction[attenuation_mask][len(attenuation_features)]),
+                    "sample_fraction": float(path_fraction[sample_index]),
                     "radius": float(np.clip(4.5 + 5.0 * blocked_fraction, 4.5, 9.0)),
                     "color": ATTENUATION_EVENT_COLOR,
                 },
             }
         )
 
-    for longitude, latitude, added_loss_db in zip(
-        path_longitude[terrain_only_blocked],
-        path_latitude[terrain_only_blocked],
-        attenuation_per_sample_db[terrain_only_blocked],
-        strict=False,
-    ):
+    for sample_index in np.flatnonzero(terrain_only_blocked):
+        added_loss_db = attenuation_per_sample_db[sample_index]
         terrain_block_features.append(
             {
                 "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [float(longitude), float(latitude)]},
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [float(line_longitude[sample_index]), float(line_latitude[sample_index])],
+                },
                 "properties": {
                     "kind": "terrain-los-block",
                     "added_loss_db": float(added_loss_db),
-                    "sample_fraction": float(path_fraction[terrain_only_blocked][len(terrain_block_features)]),
+                    "sample_fraction": float(path_fraction[sample_index]),
                     "radius": 6.5,
                     "color": TERRAIN_BLOCK_COLOR,
                 },
@@ -716,40 +1058,6 @@ def compute_native_map_path_overlay(nodes, selected_node_ids, point_path_data, b
     selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in nodes])
     if bundle is not None:
         ensure_analysis_context(bundle)
-
-    if len(selected_node_ids) == 2:
-        source = find_node(nodes, selected_node_ids[0])
-        target = find_node(nodes, selected_node_ids[1])
-        if source is None or target is None:
-            return empty_native_path_overlay()
-        if bundle is None:
-            return build_native_path_overlay(
-                source["longitude"],
-                source["latitude"],
-                target["longitude"],
-                target["latitude"],
-                PATH_PREVIEW_COLOR,
-            )
-        try:
-            link_result = compute_bidirectional_link_result(source, target)
-        except Exception:
-            return build_native_path_overlay(
-                source["longitude"],
-                source["latitude"],
-                target["longitude"],
-                target["latitude"],
-                PATH_BAD_COLOR,
-                dashed=True,
-            )
-        return build_native_path_overlay(
-            source["longitude"],
-            source["latitude"],
-            target["longitude"],
-            target["latitude"],
-            PATH_GOOD_COLOR if link_result["good_link"] else PATH_BAD_COLOR,
-            dashed=not link_result["good_link"],
-            result=link_result["forward_result"],
-        )
 
     if point_path_data:
         source = find_node(nodes, point_path_data.get("source_node_id"))
@@ -794,6 +1102,40 @@ def compute_native_map_path_overlay(nodes, selected_node_ids, point_path_data, b
             result=result,
         )
 
+    if len(selected_node_ids) == 2:
+        source = find_node(nodes, selected_node_ids[0])
+        target = find_node(nodes, selected_node_ids[1])
+        if source is None or target is None:
+            return empty_native_path_overlay()
+        if bundle is None:
+            return build_native_path_overlay(
+                source["longitude"],
+                source["latitude"],
+                target["longitude"],
+                target["latitude"],
+                PATH_PREVIEW_COLOR,
+            )
+        try:
+            link_result = compute_bidirectional_link_result(source, target)
+        except Exception:
+            return build_native_path_overlay(
+                source["longitude"],
+                source["latitude"],
+                target["longitude"],
+                target["latitude"],
+                PATH_BAD_COLOR,
+                dashed=True,
+            )
+        return build_native_path_overlay(
+            source["longitude"],
+            source["latitude"],
+            target["longitude"],
+            target["latitude"],
+            PATH_GOOD_COLOR if link_result["good_link"] else PATH_BAD_COLOR,
+            dashed=not link_result["good_link"],
+            result=link_result["forward_result"],
+        )
+
     return empty_native_path_overlay()
 
 
@@ -803,6 +1145,14 @@ def build_native_map_spec(
     terrain_alpha,
     terrain_clip_range=None,
     elevation_colorscale="Magma",
+    worldcover_enabled=False,
+    worldcover_opacity=0.0,
+    viewshed_point_data=None,
+    viewshed_radius_m=None,
+    viewshed_sample_count=None,
+    viewshed_overlay=None,
+    viewshed_colorscale="Turbo",
+    viewshed_opacity=0.0,
     rssi_overlay=None,
     rssi_colorscale="Turbo",
     loaded_bbox=None,
@@ -811,6 +1161,7 @@ def build_native_map_spec(
     rssi_opacity=0.55,
     path_overlay=None,
     overlay_context_key=None,
+    visual_context_key=None,
 ):
     normalized_nodes = [with_node_defaults(node) for node in (nodes or [])]
     selected_node_ids = normalize_selected_node_ids(selected_node_ids, [node["id"] for node in normalized_nodes])
@@ -819,6 +1170,10 @@ def build_native_map_spec(
     terrain_layer = None
     terrain_dem = None
     terrain_legend = None
+    worldcover_layer = None
+    worldcover_legend = None
+    viewshed_layer = None
+    viewshed_legend = None
     if bundle is not None:
         terrain_bounds = bundle["terrain_display_bounds"]
         terrain_display = bundle["terrain_display"]
@@ -856,10 +1211,75 @@ def build_native_map_spec(
             "pitch": DEFAULT_3D_PITCH,
             "bearing": DEFAULT_3D_BEARING,
             "color_relief": {
-                "expression": maplibre_color_relief_expression(elevation_colorscale, clip_min, clip_max),
-                "opacity": float(terrain_alpha or 0.0),
+                "expression": maplibre_color_relief_expression(
+                    elevation_colorscale,
+                    clip_min,
+                    clip_max,
+                    alpha=float(terrain_alpha or 0.0),
+                ),
+                "opacity": 1.0,
             },
         }
+
+        if worldcover_enabled:
+            worldcover_values = np.asarray(
+                bundle.get("worldcover_display", bundle["worldcover_projected"].values),
+                dtype=np.int16,
+            )
+            worldcover_codes = [
+                int(code)
+                for code in np.unique(worldcover_values)
+                if int(code) in WORLDCOVER_PALETTE and int(code) != 0
+            ]
+            worldcover_uri = colorize_value_map_to_png_uri(
+                worldcover_values,
+                {code: WORLDCOVER_PALETTE[code] for code in worldcover_codes},
+                alpha=float(worldcover_opacity or 0.0),
+            )
+            if worldcover_uri is not None:
+                worldcover_layer = {
+                    "image": worldcover_uri,
+                    "coordinates": raster_layer_coordinates(terrain_bounds),
+                    "opacity": 1.0,
+                }
+                worldcover_legend = {
+                    "type": "categorical",
+                    "title": "WorldCover",
+                    "items": [
+                        {"label": WORLDCOVER_CLASSES.get(code, str(code)), "color": WORLDCOVER_PALETTE[code]}
+                        for code in worldcover_codes
+                    ],
+                }
+
+        if viewshed_overlay is not None:
+            visible_cell_count = np.asarray(viewshed_overlay.get("visible_cell_count"), dtype=np.float32)
+            finite_cell_count = visible_cell_count[np.isfinite(visible_cell_count)]
+            if finite_cell_count.size:
+                cell_count_min = float(np.nanmin(finite_cell_count))
+                cell_count_max = float(np.nanmax(finite_cell_count))
+                if cell_count_max <= cell_count_min:
+                    cell_count_max = cell_count_min + 1.0
+                viewshed_bounds = viewshed_overlay.get("display_bounds") or terrain_bounds
+                viewshed_uri = colorize_array_to_png_uri(
+                    visible_cell_count,
+                    viewshed_colorscale,
+                    cell_count_min,
+                    cell_count_max,
+                    alpha=float(viewshed_opacity or 0.0),
+                )
+                if viewshed_uri is not None:
+                    viewshed_layer = {
+                        "image": viewshed_uri,
+                        "coordinates": raster_layer_coordinates(viewshed_bounds),
+                        "opacity": 1.0,
+                    }
+                    viewshed_legend = {
+                        "type": "gradient",
+                        "title": VIEWSHED_LEGEND_TITLE,
+                        "colorscale": viewshed_colorscale,
+                        "min": cell_count_min,
+                        "max": cell_count_max,
+                    }
 
     rssi_layer = None
     rssi_legend = None
@@ -869,7 +1289,7 @@ def build_native_map_spec(
             rssi_uri = colorize_category_array_to_png_uri(
                 np.flipud(rssi_overlay["owner_index"]),
                 [item["color"] for item in rssi_overlay.get("legend_items", [])],
-                alpha=rssi_opacity or 0.0,
+                alpha=float(rssi_opacity or 0.0),
             )
             rssi_legend = {
                 "type": "categorical",
@@ -885,7 +1305,7 @@ def build_native_map_spec(
                 rssi_colorscale,
                 -140.0,
                 -60.0,
-                alpha=rssi_opacity or 0.0,
+                alpha=float(rssi_opacity or 0.0),
             )
             rssi_legend = {
                 "type": "gradient",
@@ -894,7 +1314,7 @@ def build_native_map_spec(
                 "min": -140.0,
                 "max": -60.0,
             }
-        if rssi_uri is not None and bundle is not None and float(rssi_opacity or 0.0) > 0.0:
+        if rssi_uri is not None and bundle is not None:
             rssi_layer = {
                 "image": rssi_uri,
                 "coordinates": raster_layer_coordinates(bundle["terrain_display_bounds"]),
@@ -906,15 +1326,23 @@ def build_native_map_spec(
         "base_style": build_maplibre_style(base_map_style),
         "terrain_dem": terrain_dem,
         "terrain_layer": terrain_layer,
+        "worldcover_layer": worldcover_layer,
+        "viewshed_layer": viewshed_layer,
         "rssi_layer": rssi_layer,
         "nodes": build_node_feature_collection(normalized_nodes, selected_node_ids),
-        "loaded_bbox": build_loaded_bbox_feature_collection(bundle["terrain_display_bounds"] if bundle is not None else loaded_bbox),
+        "viewshed_point": build_viewshed_point_feature_collection(viewshed_point_data),
+        "viewshed_radius_outline": build_viewshed_radius_feature_collection(viewshed_point_data, viewshed_radius_m),
+        "viewshed_samples": build_viewshed_sample_feature_collection(viewshed_point_data, viewshed_radius_m, viewshed_sample_count),
+        "loaded_bbox": build_loaded_bbox_feature_collection(loaded_bbox),
         "path_line": path_overlay.get("line", feature_collection()),
         "attenuation_points": path_overlay.get("attenuation_points", feature_collection()),
         "terrain_block_points": path_overlay.get("terrain_block_points", feature_collection()),
         "terrain_legend": terrain_legend,
+        "worldcover_legend": worldcover_legend,
+        "viewshed_legend": viewshed_legend,
         "rssi_legend": rssi_legend,
         "overlay_context_key": str(overlay_context_key or ""),
+        "visual_context_key": str(visual_context_key or ""),
     }
 
 
@@ -969,14 +1397,45 @@ def colorize_category_array_to_png_uri(values, colors, alpha=1.0):
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def maplibre_color_relief_expression(colorscale_name, zmin, zmax, sample_count=16):
+def colorize_value_map_to_png_uri(values, value_to_color, alpha=1.0):
+    category_array = np.asarray(values)
+    if category_array.ndim != 2 or not value_to_color:
+        return None
+
+    alpha_value = int(round(np.clip(float(alpha), 0.0, 1.0) * 255.0))
+    if alpha_value <= 0:
+        return None
+
+    rgba = np.zeros(category_array.shape + (4,), dtype=np.uint8)
+    valid_values = np.array([int(value) for value in value_to_color], dtype=np.int16)
+    valid_mask = np.isin(category_array, valid_values)
+    if not np.any(valid_mask):
+        return None
+
+    for value, color in value_to_color.items():
+        rgba[category_array == int(value)] = ImageColor.getcolor(str(color), "RGBA")
+    rgba[..., 3] = np.where(valid_mask, alpha_value, 0).astype(np.uint8)
+
+    image = Image.fromarray(rgba, mode="RGBA")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def rgba_with_alpha(color, alpha):
+    red, green, blue, _ = ImageColor.getcolor(str(color), "RGBA")
+    alpha_value = int(round(np.clip(float(alpha), 0.0, 1.0) * 255.0))
+    return f"rgba({red}, {green}, {blue}, {alpha_value / 255.0:.6f})"
+
+
+def maplibre_color_relief_expression(colorscale_name, zmin, zmax, alpha=1.0, sample_count=16):
     lower = float(zmin)
     upper = max(float(zmax), lower + 1e-6)
     stops = np.linspace(lower, upper, sample_count)
     colors = sample_colorscale(colorscale_name, np.linspace(0.0, 1.0, sample_count))
     expression = ["interpolate", ["linear"], ["elevation"]]
     for stop, color in zip(stops, colors, strict=False):
-        expression.extend([float(stop), color])
+        expression.extend([float(stop), rgba_with_alpha(color, alpha)])
     return expression
 
 
@@ -1171,48 +1630,43 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
         max_lon,
         max_lat,
     )
+    display_width, display_height = geographic_bbox_to_pixel_shape(min_lon, min_lat, max_lon, max_lat)
+    projected_width, projected_height = extent_to_pixel_shape(min_x, min_y, max_x, max_y)
 
-    display_terrain_meta_url = (
-        "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
-        f"?bbox={min_lon},{min_lat},{max_lon},{max_lat}"
-        f"&bboxSR={GEOGRAPHIC_CRS.split(':')[-1]}"
-        f"&imageSR={GEOGRAPHIC_CRS.split(':')[-1]}"
-        f"&size={DISPLAY_WIDTH},{DISPLAY_HEIGHT}"
-        "&format=tiff"
-        "&pixelType=F32"
-        "&interpolation=RSP_BilinearInterpolation"
-        "&f=json"
+    display_terrain_href = elevation_export_image_href(
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+        GEOGRAPHIC_CRS,
+        display_width,
+        display_height,
     )
-    display_terrain_href = fetch_image_href(display_terrain_meta_url)
-
-    projected_terrain_meta_url = (
-        "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
-        f"?bbox={min_x},{min_y},{max_x},{max_y}"
-        f"&bboxSR={PROJECTED_CRS.split(':')[-1]}"
-        f"&imageSR={PROJECTED_CRS.split(':')[-1]}"
-        f"&size={DISPLAY_WIDTH},{DISPLAY_HEIGHT}"
-        "&format=tiff"
-        "&pixelType=F32"
-        "&interpolation=RSP_BilinearInterpolation"
-        "&f=json"
+    projected_terrain_href = elevation_export_image_href(
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        PROJECTED_CRS,
+        projected_width,
+        projected_height,
     )
-    projected_terrain_href = fetch_image_href(projected_terrain_meta_url)
 
     with open_remote_raster(display_terrain_href) as src:
         terrain_display = src.read(1).astype(np.float32)
-        terrain_display_transform = resolved_raster_transform(src, min_lon, min_lat, max_lon, max_lat)
+        terrain_display_transform = rasterio.transform.from_bounds(min_lon, min_lat, max_lon, max_lat, src.width, src.height)
         terrain_display_lon_axis, terrain_display_lat_axis = raster_axes(terrain_display_transform, src.height, src.width)
         terrain_display_shape = (src.height, src.width)
         terrain_display_bounds = {
-            "min_lon": float(min_lon if tuple(src.transform) == tuple(rasterio.transform.Affine.identity()) else src.bounds.left),
-            "min_lat": float(min_lat if tuple(src.transform) == tuple(rasterio.transform.Affine.identity()) else src.bounds.bottom),
-            "max_lon": float(max_lon if tuple(src.transform) == tuple(rasterio.transform.Affine.identity()) else src.bounds.right),
-            "max_lat": float(max_lat if tuple(src.transform) == tuple(rasterio.transform.Affine.identity()) else src.bounds.top),
+            "min_lon": float(min_lon),
+            "min_lat": float(min_lat),
+            "max_lon": float(max_lon),
+            "max_lat": float(max_lat),
         }
 
     with open_remote_raster(projected_terrain_href) as src:
         terrain_band = src.read(1).astype(np.float32)
-        projected_transform = resolved_raster_transform(src, min_x, min_y, max_x, max_y)
+        projected_transform = rasterio.transform.from_bounds(min_x, min_y, max_x, max_y, src.width, src.height)
         projected_shape = (src.height, src.width)
         terrain_x_axis, terrain_y_axis = raster_axes(projected_transform, src.height, src.width)
 
@@ -1232,6 +1686,20 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
                 resampling=Resampling.nearest,
                 init_dest_nodata=False,
             )
+
+    worldcover_display = np.zeros(terrain_display_shape, dtype=np.uint8)
+    safe_reproject(
+        source=worldcover_band,
+        destination=worldcover_display,
+        src_transform=projected_transform,
+        src_crs=PROJECTED_CRS,
+        src_nodata=0,
+        dst_transform=terrain_display_transform,
+        dst_crs=GEOGRAPHIC_CRS,
+        dst_nodata=0,
+        resampling=Resampling.nearest,
+        init_dest_nodata=False,
+    )
 
     terrain_projected = xr.DataArray(
         terrain_band,
@@ -1262,9 +1730,101 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
         "terrain_display_shape": terrain_display_shape,
         "terrain_display_bounds": terrain_display_bounds,
         "terrain_projected": terrain_projected,
+        "worldcover_display": worldcover_display,
         "worldcover_projected": worldcover_projected,
         "projected_transform": projected_transform,
         "projected_shape": projected_shape,
+    }
+
+
+@lru_cache(maxsize=128)
+def get_viewshed_assessment_terrain(longitude, latitude, radius_m):
+    longitude = float(longitude)
+    latitude = float(latitude)
+    radius_m = max(float(radius_m), 1.0)
+
+    projected_x, projected_y = transform(
+        GEOGRAPHIC_CRS,
+        PROJECTED_CRS,
+        [longitude],
+        [latitude],
+    )
+    center_x = float(projected_x[0])
+    center_y = float(projected_y[0])
+    min_x = center_x - radius_m
+    min_y = center_y - radius_m
+    max_x = center_x + radius_m
+    max_y = center_y + radius_m
+    span_m = max(max_x - min_x, max_y - min_y)
+    projected_dim = span_to_sample_dim(
+        span_m,
+        VIEWSHED_ASSESSMENT_TARGET_RESOLUTION_M,
+        VIEWSHED_ASSESSMENT_MIN_DIM,
+        VIEWSHED_ASSESSMENT_MAX_DIM,
+    )
+
+    terrain_href = elevation_export_image_href(
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        PROJECTED_CRS,
+        projected_dim,
+        projected_dim,
+    )
+    with open_remote_raster(terrain_href) as src:
+        terrain_values = src.read(1).astype(np.float32)
+        projected_transform = rasterio.transform.from_bounds(min_x, min_y, max_x, max_y, src.width, src.height)
+        terrain_x_axis, terrain_y_axis = raster_axes(projected_transform, src.height, src.width)
+        projected_shape = (src.height, src.width)
+
+    display_min_lon, display_min_lat, display_max_lon, display_max_lat = transform_bounds(
+        PROJECTED_CRS,
+        GEOGRAPHIC_CRS,
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+    )
+    display_width, display_height = geographic_bbox_to_pixel_shape(
+        display_min_lon,
+        display_min_lat,
+        display_max_lon,
+        display_max_lat,
+        max_dim=max(projected_shape),
+        min_dim=min(projected_shape),
+    )
+    display_transform = rasterio.transform.from_bounds(
+        display_min_lon,
+        display_min_lat,
+        display_max_lon,
+        display_max_lat,
+        display_width,
+        display_height,
+    )
+    display_lon_axis, display_lat_axis = raster_axes(display_transform, display_height, display_width)
+
+    return {
+        "terrain_da": xr.DataArray(
+            terrain_values,
+            dims=("y", "x"),
+            coords={"y": terrain_y_axis, "x": terrain_x_axis},
+            name="elevation",
+        ).sortby("y", ascending=False),
+        "projected_transform": projected_transform,
+        "projected_shape": projected_shape,
+        "display_transform": display_transform,
+        "display_shape": (display_height, display_width),
+        "display_bounds": {
+            "min_lon": float(display_min_lon),
+            "min_lat": float(display_min_lat),
+            "max_lon": float(display_max_lon),
+            "max_lat": float(display_max_lat),
+        },
+        "display_lon_axis": display_lon_axis.astype(np.float64),
+        "display_lat_axis": display_lat_axis.astype(np.float64),
+        "center_x": center_x,
+        "center_y": center_y,
     }
 
 
@@ -1714,6 +2274,294 @@ def build_observer_frame(nodes):
     observer_frame["x"] = projected_x
     observer_frame["y"] = projected_y
     return observer_frame
+
+
+def bounded_cache_put(cache, key, value, max_size=8):
+    cache[key] = value
+    while len(cache) > int(max_size):
+        cache.pop(next(iter(cache)))
+
+
+def send_desktop_notification(title, message):
+    if DESKTOP_NOTIFIER is None:
+        return False
+
+    async def _send():
+        await DESKTOP_NOTIFIER.send(
+            title=str(title),
+            message=str(message),
+        )
+
+    def _worker():
+        try:
+            asyncio.run(_send())
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return True
+
+
+def effective_viewshed_sample_count(sample_count=None, max_samples=VIEWSHED_ASSESSMENT_MAX_SAMPLES):
+    resolved_sample_count = int(sample_count or DEFAULT_VIEWSHED_SAMPLE_COUNT)
+    if resolved_sample_count in VIEWSHED_SAMPLE_COUNT_OPTIONS:
+        return int(min(int(max_samples), resolved_sample_count))
+    return int(min(int(max_samples), DEFAULT_VIEWSHED_SAMPLE_COUNT))
+
+
+def centered_circular_ring_count(target_sample_count):
+    target_sample_count = max(1, int(target_sample_count))
+    if target_sample_count <= 1:
+        return 0
+
+    ring_count = int(round((math.sqrt((4.0 * float(target_sample_count)) - 1.0) - 1.0) / 2.0))
+    if 1 + 3 * ring_count * (ring_count + 1) == target_sample_count:
+        return ring_count
+
+    closest_ring_count = 1
+    closest_error = None
+    for candidate_ring_count in range(1, 16):
+        candidate_count = 1 + 3 * candidate_ring_count * (candidate_ring_count + 1)
+        candidate_error = abs(candidate_count - target_sample_count)
+        if closest_error is None or candidate_error < closest_error:
+            closest_ring_count = candidate_ring_count
+            closest_error = candidate_error
+    return closest_ring_count
+
+
+def generate_circular_samples(center_x, center_y, radius_m, target_sample_count):
+    center_x = float(center_x)
+    center_y = float(center_y)
+    radius_m = float(radius_m)
+    target_sample_count = max(1, int(target_sample_count))
+    if target_sample_count <= 1 or radius_m <= 0:
+        return np.asarray([[center_x, center_y]], dtype=np.float64)
+
+    ring_count = centered_circular_ring_count(target_sample_count)
+
+    samples = [(center_x, center_y)]
+    for ring_index in range(1, ring_count + 1):
+        ring_sample_count = 6 * ring_index
+        ring_radius = radius_m * (float(ring_index) / float(ring_count))
+        angular_offset = math.pi / float(ring_sample_count)
+        for sample_index in range(ring_sample_count):
+            angle = angular_offset + (2.0 * math.pi * float(sample_index) / float(ring_sample_count))
+            sample_x = center_x + ring_radius * math.cos(angle)
+            sample_y = center_y + ring_radius * math.sin(angle)
+            samples.append((sample_x, sample_y))
+    return np.asarray(samples, dtype=np.float64)
+
+
+def interpolate_viewshed_rbf(sample_points, sample_scores, target_points):
+    sample_points = np.asarray(sample_points, dtype=np.float64)
+    sample_scores = np.asarray(sample_scores, dtype=np.float64)
+    target_points = np.asarray(target_points, dtype=np.float64)
+    if sample_points.shape[0] == 0 or target_points.shape[0] == 0:
+        return np.asarray([], dtype=np.float32)
+    if sample_points.shape[0] == 1:
+        return np.full(target_points.shape[0], float(sample_scores[0]), dtype=np.float32)
+
+    interpolator = RBFInterpolator(
+        sample_points,
+        sample_scores,
+        kernel="linear",
+        smoothing=0.0,
+    )
+    return np.asarray(interpolator(target_points), dtype=np.float32)
+
+
+def viewshed_assessment_cache_key(bundle, point_data, radius_m, observer_height_agl, sample_count):
+    payload = "|".join(
+        [
+            VIEWSHED_ASSESSMENT_METRIC_VERSION,
+            str(bundle["cache_key"]),
+            viewshed_point_signature(point_data),
+            f"{float(radius_m):.3f}",
+            f"{float(observer_height_agl):.3f}",
+            str(int(sample_count)),
+        ]
+    )
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+
+def resolve_viewshed_assessment(bundle, assessment_store, radius_m=None, observer_height_agl=None, sample_count=None):
+    if not bundle or not assessment_store:
+        return None
+    if tuple(assessment_store.get("bundle_key", ())) != bundle["cache_key"]:
+        return None
+    if radius_m is not None:
+        stored_radius = assessment_store.get("radius_m")
+        if stored_radius is None or not math.isclose(float(stored_radius), float(radius_m), rel_tol=0.0, abs_tol=1e-6):
+            return None
+    if observer_height_agl is not None:
+        stored_height = assessment_store.get("observer_height_agl")
+        if stored_height is None or not math.isclose(
+            float(stored_height),
+            float(observer_height_agl),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            return None
+    if sample_count is not None:
+        stored_sample_count = assessment_store.get("sample_count")
+        if stored_sample_count is None or int(stored_sample_count) != int(sample_count):
+            return None
+    cache_key = str(assessment_store.get("cache_key") or "")
+    if not cache_key:
+        return None
+    return VIEWSHED_ASSESSMENT_CACHE.get(cache_key)
+
+
+def compute_viewshed_assessment(
+    point_data,
+    bundle,
+    radius_m=VIEWSHED_ASSESSMENT_RADIUS_M,
+    observer_height_agl=VIEWSHED_ASSESSMENT_OBSERVER_HEIGHT_AGL_M,
+    max_samples=VIEWSHED_ASSESSMENT_MAX_SAMPLES,
+    sample_count=DEFAULT_VIEWSHED_SAMPLE_COUNT,
+):
+    if not point_data or not bundle:
+        return None, None
+
+    longitude = point_data.get("longitude")
+    latitude = point_data.get("latitude")
+    if longitude is None or latitude is None:
+        return None, None
+
+    effective_sample_count = effective_viewshed_sample_count(sample_count, max_samples=max_samples)
+    cache_key = viewshed_assessment_cache_key(bundle, point_data, radius_m, observer_height_agl, effective_sample_count)
+    if cache_key in VIEWSHED_ASSESSMENT_CACHE:
+        return cache_key, VIEWSHED_ASSESSMENT_CACHE[cache_key]
+
+    ensure_analysis_context(bundle)
+    full_terrain_da = ANALYSIS_CONTEXT["terrain_da"]
+    full_valid_mask = np.isfinite(np.asarray(full_terrain_da.values, dtype=np.float32))
+
+    terrain_window = get_viewshed_assessment_terrain(longitude, latitude, radius_m)
+    terrain_da = terrain_window["terrain_da"]
+    terrain_values = np.asarray(terrain_da.values, dtype=np.float32)
+    terrain_x = terrain_da.x.values.astype(np.float64)
+    terrain_y = terrain_da.y.values.astype(np.float64)
+    if terrain_values.ndim != 2 or terrain_x.size < 2 or terrain_y.size < 2:
+        return None, None
+
+    projected_x, projected_y = transform(
+        GEOGRAPHIC_CRS,
+        PROJECTED_CRS,
+        [float(longitude)],
+        [float(latitude)],
+    )
+    center_row = int(np.abs(terrain_y - float(projected_y[0])).argmin())
+    center_col = int(np.abs(terrain_x - float(projected_x[0])).argmin())
+    x_step = float(abs(terrain_x[1] - terrain_x[0]))
+    y_step = float(abs(terrain_y[1] - terrain_y[0]))
+    radius_m = max(float(radius_m), max(x_step, y_step))
+
+    local_terrain = terrain_da
+    local_values = terrain_values
+    local_x = terrain_x
+    local_y = terrain_y
+
+    dx = local_x[None, :] - float(projected_x[0])
+    dy = local_y[:, None] - float(projected_y[0])
+    candidate_domain_mask = (dx * dx + dy * dy) <= float(radius_m) ** 2
+    if not np.any(candidate_domain_mask):
+        candidate_domain_mask[max(0, center_row), max(0, center_col)] = True
+
+    valid_local_mask = np.isfinite(local_values)
+    finite_local = local_values[valid_local_mask & candidate_domain_mask]
+    if finite_local.size == 0:
+        return None, None
+
+    local_min_x = float(np.min(local_x) - (x_step / 2.0))
+    local_max_x = float(np.max(local_x) + (x_step / 2.0))
+    local_min_y = float(np.min(local_y) - (y_step / 2.0))
+    local_max_y = float(np.max(local_y) + (y_step / 2.0))
+    sample_points = generate_circular_samples(
+        float(projected_x[0]),
+        float(projected_y[0]),
+        radius_m,
+        effective_sample_count,
+    )
+    sampled_scores = []
+    sampled_points = []
+    for sample_x, sample_y in sample_points:
+        if sample_x < local_min_x or sample_x > local_max_x or sample_y < local_min_y or sample_y > local_max_y:
+            continue
+        visible = viewshed(
+            full_terrain_da,
+            x=float(sample_x),
+            y=float(sample_y),
+            observer_elev=float(observer_height_agl),
+            target_elev=0.0,
+        )
+        visible_mask = np.asarray(visible > 0)
+        sampled_points.append((float(sample_x), float(sample_y)))
+        sampled_scores.append(float(np.count_nonzero(visible_mask & full_valid_mask)))
+
+    if not sampled_scores:
+        return None, None
+
+    local_score = np.full(local_values.shape, np.nan, dtype=np.float32)
+    target_rows, target_cols = np.where(candidate_domain_mask & valid_local_mask)
+    target_points = np.column_stack((local_x[target_cols], local_y[target_rows]))
+    interpolated_scores = interpolate_viewshed_rbf(
+        sampled_points,
+        sampled_scores,
+        target_points,
+    )
+    local_score[target_rows, target_cols] = interpolated_scores
+    projected_score = np.where(candidate_domain_mask & valid_local_mask, local_score, np.nan)
+
+    display_score = np.full(terrain_window["display_shape"], np.nan, dtype=np.float32)
+    safe_reproject(
+        source=projected_score,
+        destination=display_score,
+        src_transform=terrain_window["projected_transform"],
+        src_crs=PROJECTED_CRS,
+        src_nodata=np.nan,
+        dst_transform=terrain_window["display_transform"],
+        dst_crs=GEOGRAPHIC_CRS,
+        dst_nodata=np.nan,
+        resampling=Resampling.bilinear,
+    )
+    projected_mask = candidate_domain_mask.astype(np.uint8)
+    display_mask = np.zeros(terrain_window["display_shape"], dtype=np.uint8)
+    safe_reproject(
+        source=projected_mask,
+        destination=display_mask,
+        src_transform=terrain_window["projected_transform"],
+        src_crs=PROJECTED_CRS,
+        src_nodata=0,
+        dst_transform=terrain_window["display_transform"],
+        dst_crs=GEOGRAPHIC_CRS,
+        dst_nodata=0,
+        resampling=Resampling.nearest,
+        init_dest_nodata=False,
+    )
+    display_score = np.where(display_mask > 0, display_score, np.nan)
+
+    finite_display = display_score[np.isfinite(display_score)]
+    if finite_display.size == 0:
+        return None, None
+
+    result = {
+        "visible_cell_count": display_score,
+        "lon_axis": terrain_window["display_lon_axis"],
+        "lat_axis": terrain_window["display_lat_axis"],
+        "display_bounds": terrain_window["display_bounds"],
+        "min": float(np.nanmin(finite_display)),
+        "max": float(np.nanmax(finite_display)),
+        "radius_m": float(radius_m),
+        "observer_height_agl": float(observer_height_agl),
+        "sample_count": int(effective_sample_count),
+        "point": {
+            "longitude": float(longitude),
+            "latitude": float(latitude),
+        },
+    }
+    bounded_cache_put(VIEWSHED_ASSESSMENT_CACHE, cache_key, result)
+    return cache_key, result
 
 
 def compute_bidirectional_link_result(source, target):
@@ -2610,7 +3458,8 @@ def parse_uploaded_nodes(contents):
 def build_node_upload_component():
     return dcc.Upload(
         id="node-upload",
-        children=html.Button("Load Nodes CSV", style={"width": "100%"}),
+        children=html.Button("Load Nodes CSV", id="load-nodes-button", style={"width": "100%"}, disabled=True),
+        disabled=True,
         multiple=False,
     )
 
@@ -2655,169 +3504,317 @@ app.layout = [
     dcc.Store(id="map-view-store", data=DEFAULT_BBOX),
     dcc.Store(id="native-map-spec-store", data=None),
     dcc.Store(id="native-map-hover-store", data=None),
+    dcc.Store(id="terrain-ready-store", data=False),
     dcc.Store(id="bbox-store", data=None),
+    dcc.Store(id="bbox-preview-store", data=DEFAULT_BBOX),
     dcc.Store(id="rssi-calculation-store", data=None),
     dcc.Store(id="rssi-overlay-selection-store", data={}),
     dcc.Store(id="map-interaction-loading-store", data=False),
     dcc.Store(id="map-interaction-loading-message-store", data=DEFAULT_MAP_LOADING_MESSAGE),
+    dcc.Store(id="terrain-load-notification-store", data=None),
     dcc.Store(id="rssi-run-request-store", data=None),
     dcc.Store(id="rssi-progress-meta-store", data=None),
     dcc.Store(id="rssi-progress-complete-store", data=None),
     dcc.Store(id="point-path-store", data=None),
+    dcc.Store(id="viewshed-point-store", data=None),
+    dcc.Store(id="viewshed-assessment-store", data=None),
     dcc.Download(id="node-download"),
     dcc.Interval(id="rssi-progress-interval", interval=1000, n_intervals=0, disabled=True),
-    html.H1("Non Flatlander Mesh Terrain Planner (NF-MTP)", style={"textAlign": "center", "color": "#f9fafb"}),
+    html.Div(
+        [
+            html.Img(src=app.get_asset_url("logo.svg"), className="app-logo", alt="NF-MTP logo"),
+            html.H1(
+                "Non Flatlander Mesh Terrain Planner (NF-MTP)",
+                style={"textAlign": "center", "color": "#f9fafb", "margin": "0"},
+            ),
+        ],
+        className="app-header",
+    ),
     html.Div(id="top-banner-container"),
     html.Div(
         [
             html.Div(
                 [
-                    html.Div(
+                    html.Details(
                         [
-                            html.Div(
+                            html.Summary(
                                 "Terrain Overlay",
-                                title="Control the terrain layer visibility, displayed elevation range, and how elevation colors are clipped on the map.",
-                                style={"fontWeight": "600"},
+                                title="Control terrain visibility, clipping, map styling, and optional WorldCover display.",
+                                style={"fontWeight": "600", "cursor": "pointer"},
                             ),
                             html.Div(
-                                "Adjust the terrain layer visibility and the elevation band emphasized on the map.",
-                                style={"fontSize": "12px", "color": "#cbd5e1"},
-                            ),
-                            html.Div("Terrain overlay alpha", style={"fontWeight": "600", "marginTop": "4px"}),
-                            dcc.Slider(0, 1, step=0.05, value=0.45, id="elevation_alpha"),
-                            html.Div("Terrain elevation clipping range (m)", style={"fontWeight": "600", "marginTop": "4px"}),
-                            dcc.RangeSlider(
-                                id="elevation_clip_range",
-                                min=0,
-                                max=1,
-                                value=[0, 1],
-                                allowCross=False,
-                                tooltip={"placement": "bottom"},
-                            ),
-                            html.Button(
-                                "Set Clipping To Current View",
-                                id="clip-visible-elevation-range",
-                                n_clicks=0,
-                                style={"width": "100%"},
-                            ),
-                            html.Button(
-                                "Set Terrain Load Box From View",
-                                id="toggle-terrain-bbox",
-                                n_clicks=0,
-                                style={"width": "100%"},
-                            ),
-                            html.Div(id="terrain-bbox-status", style={"fontSize": "12px", "color": "#cbd5e1"}),
-                            html.Details(
                                 [
-                                    html.Summary(
-                                        "Map Settings",
-                                        title="Set the longitude and latitude bounds for the terrain area to load, then choose the elevation colormap used for display.",
-                                        style={"fontWeight": "600", "cursor": "pointer"},
+                                    html.Div(
+                                        "Adjust the terrain layer visibility and the elevation band emphasized on the map.",
+                                        style={"fontSize": "12px", "color": "#cbd5e1"},
                                     ),
                                     html.Div(
-                                        [
-                                            html.Div(
-                                                "Define the geographic bounds to load and choose how the elevation layer is colored.",
-                                                style={"fontSize": "12px", "color": "#cbd5e1"},
-                                            ),
-                                            html.Div("Minimum longitude (west boundary)", style={"fontSize": "12px", "color": "#cbd5e1"}),
-                                            dcc.Input(id="min_lon", type="number", value=DEFAULT_BBOX["min_lon"], style={"width": "100%"}),
-                                            html.Div("Minimum latitude (south boundary)", style={"fontSize": "12px", "color": "#cbd5e1"}),
-                                            dcc.Input(id="min_lat", type="number", value=DEFAULT_BBOX["min_lat"], style={"width": "100%"}),
-                                            html.Div("Maximum longitude (east boundary)", style={"fontSize": "12px", "color": "#cbd5e1"}),
-                                            dcc.Input(id="max_lon", type="number", value=DEFAULT_BBOX["max_lon"], style={"width": "100%"}),
-                                            html.Div("Maximum latitude (north boundary)", style={"fontSize": "12px", "color": "#cbd5e1"}),
-                                            dcc.Input(id="max_lat", type="number", value=DEFAULT_BBOX["max_lat"], style={"width": "100%"}),
-                                            html.Div("Base map style", style={"fontWeight": "600", "marginTop": "8px"}),
-                                            dcc.Dropdown(
-                                                id="base-map-style",
-                                                options=BASE_MAP_STYLE_OPTIONS,
-                                                value="satellite",
-                                                clearable=False,
-                                            ),
-                                            html.Div("Elevation colormap", style={"fontWeight": "600", "marginTop": "8px"}),
-                                            dcc.Dropdown(
-                                                id="elevation-colormap",
-                                                options=[{"label": value, "value": value} for value in ELEVATION_COLOR_SCALE_OPTIONS],
-                                                value="Magma",
-                                                clearable=False,
-                                            ),
-                                            html.Button("Load Elevation + Worldcover", id="update_graph", n_clicks=0, style={"width": "100%"}),
-                                        ],
-                                        style={"display": "flex", "flexDirection": "column", "gap": "8px", "marginTop": "10px"},
+                                        "Terrain-driven controls unlock after the first successful terrain load.",
+                                        style={"fontSize": "12px", "color": "#94a3b8"},
                                     ),
+                                    html.Div("Terrain overlay alpha", style={"fontWeight": "600", "marginTop": "4px"}),
+                                    dcc.Slider(0, 1, step=0.05, value=0.45, id="elevation_alpha", disabled=True, updatemode="mouseup"),
+                                    html.Div("Terrain elevation clipping range (m)", style={"fontWeight": "600", "marginTop": "4px"}),
+                                    dcc.RangeSlider(
+                                        id="elevation_clip_range",
+                                        min=0,
+                                        max=1,
+                                        value=[0, 1],
+                                        allowCross=False,
+                                        tooltip={"placement": "bottom"},
+                                        disabled=True,
+                                    ),
+                                    html.Button(
+                                        "Set Clipping To Current View",
+                                        id="clip-visible-elevation-range",
+                                        n_clicks=0,
+                                        style={"width": "100%"},
+                                        disabled=True,
+                                    ),
+                                    html.Div("Base map style", style={"fontWeight": "600", "marginTop": "8px"}),
+                                    dcc.Dropdown(
+                                        id="base-map-style",
+                                        options=BASE_MAP_STYLE_OPTIONS,
+                                        value="satellite",
+                                        clearable=False,
+                                    ),
+                                    html.Div("Elevation colormap", style={"fontWeight": "600", "marginTop": "8px"}),
+                                    dcc.Dropdown(
+                                        id="elevation-colormap",
+                                        options=[{"label": value, "value": value} for value in ELEVATION_COLOR_SCALE_OPTIONS],
+                                        value="Magma",
+                                        clearable=False,
+                                    ),
+                                    dcc.Checklist(
+                                        id="worldcover-display",
+                                        options=[{"label": " Show WorldCover layer", "value": "enabled", "disabled": True}],
+                                        value=[],
+                                    ),
+                                    html.Div("WorldCover opacity", style={"fontWeight": "600", "marginTop": "4px"}),
+                                    dcc.Slider(0, 1, step=0.05, value=0.55, id="worldcover-opacity", disabled=True, updatemode="mouseup"),
                                 ],
-                                id="map-bounds-section",
-                                open=True,
-                            ),
-                            html.Details(
-                                [
-                                    html.Summary(
-                                        "RSSI Calculations",
-                                        title="Configure the RSSI overlay appearance and receiver assumptions, then run or update the node coverage calculations.",
-                                        style={"fontWeight": "600", "cursor": "pointer"},
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Div(
-                                                "Configure receiver assumptions, overlay appearance, and when to run coverage calculations.",
-                                                style={"fontSize": "12px", "color": "#cbd5e1"},
-                                            ),
-                                            html.Div("RSSI overlay opacity", style={"fontWeight": "600", "marginTop": "8px"}),
-                                            dcc.Slider(0, 1, step=0.05, value=0.55, id="rssi-opacity"),
-                                            html.Div("Global RX Height AGL (m)", style={"fontWeight": "600"}),
-                                            dcc.Input(id="global-rx-height-agl", type="number", value=DEFAULT_NODE_HEIGHT_M, style={"width": "100%"}),
-                                            html.Div("Global RX Antenna Gain (dBi)", style={"fontWeight": "600"}),
-                                            dcc.Input(id="global-rx-gain-dbi", type="number", value=DEFAULT_RX_GAIN_DBI, style={"width": "100%"}),
-                                            html.Div("Max RSSI colormap", style={"fontWeight": "600", "marginTop": "8px"}),
-                                            dcc.Dropdown(
-                                                id="rssi-colormap",
-                                                options=[{"label": value, "value": value} for value in RSSI_COLOR_SCALE_OPTIONS],
-                                                value="Turbo",
-                                                clearable=False,
-                                            ),
-                                            html.Div("RSSI display mode", style={"fontWeight": "600", "marginTop": "8px"}),
-                                            dcc.RadioItems(
-                                                id="rssi-render-mode",
-                                                options=RSSI_RENDER_MODE_OPTIONS,
-                                                value="max-rssi",
-                                                labelStyle={"display": "block", "marginBottom": "4px"},
-                                                inputStyle={"marginRight": "8px"},
-                                            ),
-                                            html.Button("Draw RSSI For All Nodes", id="draw-rssi-overlay", n_clicks=0, style={"width": "100%"}),
-                                            html.Progress(id="rssi-progress-bar", value="0", max="100", style={"width": "100%", "height": "14px"}),
-                                            html.Div(id="rssi-progress-label", style={"fontSize": "12px", "color": "#cbd5e1"}),
-                                            dcc.Checklist(
-                                                id="include-rssi-ground-loss",
-                                                options=[{"label": " Include per-cell path attenuation in RSSI overlay", "value": "enabled"}],
-                                                value=[],
-                                            ),
-                                            html.Div(
-                                                "⚠️Very Computationally Intensive (1H+ for 10 Nodes)",
-                                                style={"fontSize": "12px", "color": "#cbd5e1"},
-                                            ),
-
-                                        ],
-                                        style={"display": "flex", "flexDirection": "column", "gap": "8px", "marginTop": "10px"},
-                                    ),
-                                ],
-                                open=True,
+                                style={"display": "flex", "flexDirection": "column", "gap": "10px", "marginTop": "10px"},
                             ),
                         ],
-                        style={
-                            "width": "320px",
-                            "backgroundColor": "#111827",
-                            "padding": "16px",
-                            "display": "flex",
-                            "flexDirection": "column",
-                            "gap": "12px",
-                            "borderRadius": "8px",
-                            "border": "1px solid #374151",
-                            "color": "#e5e7eb",
-                        },
+                        id="terrain-overlay-section",
+                        open=False,
+                    ),
+                    html.Details(
+                        [
+                            html.Summary(
+                                "Map Settings",
+                                title="Set the longitude and latitude bounds for the terrain area to load.",
+                                style={"fontWeight": "600", "cursor": "pointer"},
+                            ),
+                            html.Div(
+                                [
+                                    html.Div(
+                                        "Define the geographic bounds to load, or copy the current native map viewport into the terrain bounding box.",
+                                        style={"fontSize": "12px", "color": "#cbd5e1"},
+                                    ),
+                                    html.Div("Minimum longitude (west boundary)", style={"fontSize": "12px", "color": "#cbd5e1"}),
+                                    dcc.Input(id="min_lon", type="number", value=DEFAULT_BBOX["min_lon"], style={"width": "100%"}),
+                                    html.Div("Minimum latitude (south boundary)", style={"fontSize": "12px", "color": "#cbd5e1"}),
+                                    dcc.Input(id="min_lat", type="number", value=DEFAULT_BBOX["min_lat"], style={"width": "100%"}),
+                                    html.Div("Maximum longitude (east boundary)", style={"fontSize": "12px", "color": "#cbd5e1"}),
+                                    dcc.Input(id="max_lon", type="number", value=DEFAULT_BBOX["max_lon"], style={"width": "100%"}),
+                                    html.Div("Maximum latitude (north boundary)", style={"fontSize": "12px", "color": "#cbd5e1"}),
+                                    dcc.Input(id="max_lat", type="number", value=DEFAULT_BBOX["max_lat"], style={"width": "100%"}),
+                                    html.Button(
+                                        "Set Terrain Bounding Box",
+                                        id="toggle-terrain-bbox",
+                                        n_clicks=0,
+                                        style={"width": "100%"},
+                                    ),
+                                    html.Div(id="terrain-bbox-status", style={"fontSize": "12px", "color": "#cbd5e1"}),
+                                    html.Button(
+                                        "Load Elevation + Worldcover",
+                                        id="update_graph",
+                                        n_clicks=0,
+                                        style={
+                                            "width": "100%",
+                                            "backgroundColor": "#166534",
+                                            "borderColor": "#22c55e",
+                                            "color": "#f0fdf4",
+                                        },
+                                    ),
+                                ],
+                                style={"display": "flex", "flexDirection": "column", "gap": "8px", "marginTop": "10px"},
+                            ),
+                        ],
+                        id="map-bounds-section",
+                        open=True,
+                    ),
+                    html.Details(
+                        [
+                            html.Summary(
+                                "RSSI Calculations",
+                                title="Configure the RSSI overlay appearance and receiver assumptions, then run or update the node coverage calculations.",
+                                style={"fontWeight": "600", "cursor": "pointer"},
+                            ),
+                            html.Div(
+                                [
+                                    html.Div(
+                                        "Configure receiver assumptions, overlay appearance, and when to run coverage calculations.",
+                                        style={"fontSize": "12px", "color": "#cbd5e1"},
+                                    ),
+                                    html.Div("RSSI overlay opacity", style={"fontWeight": "600", "marginTop": "8px"}),
+                                    dcc.Slider(0, 1, step=0.05, value=0.55, id="rssi-opacity", updatemode="mouseup"),
+                                    html.Div("Global RX Height AGL (m)", style={"fontWeight": "600"}),
+                                    dcc.Input(id="global-rx-height-agl", type="number", value=DEFAULT_NODE_HEIGHT_M, style={"width": "100%"}),
+                                    html.Div("Global RX Antenna Gain (dBi)", style={"fontWeight": "600"}),
+                                    dcc.Input(id="global-rx-gain-dbi", type="number", value=DEFAULT_RX_GAIN_DBI, style={"width": "100%"}),
+                                    html.Div("Max RSSI colormap", style={"fontWeight": "600", "marginTop": "8px"}),
+                                    dcc.Dropdown(
+                                        id="rssi-colormap",
+                                        options=[{"label": value, "value": value} for value in RSSI_COLOR_SCALE_OPTIONS],
+                                        value="Turbo",
+                                        clearable=False,
+                                    ),
+                                    html.Div("RSSI display mode", style={"fontWeight": "600", "marginTop": "8px"}),
+                                    dcc.RadioItems(
+                                        id="rssi-render-mode",
+                                        options=RSSI_RENDER_MODE_OPTIONS,
+                                        value="max-rssi",
+                                        labelStyle={"display": "block", "marginBottom": "4px"},
+                                        inputStyle={"marginRight": "8px"},
+                                    ),
+                                    html.Button(
+                                        "Draw RSSI For All Nodes",
+                                        id="draw-rssi-overlay",
+                                        n_clicks=0,
+                                        style={"width": "100%"},
+                                        disabled=True,
+                                    ),
+                                    html.Progress(id="rssi-progress-bar", value="0", max="100", style={"width": "100%", "height": "14px"}),
+                                    html.Div(id="rssi-progress-label", style={"fontSize": "12px", "color": "#cbd5e1"}),
+                                    dcc.Checklist(
+                                        id="include-rssi-ground-loss",
+                                        options=[{"label": " Include per-cell path attenuation in RSSI overlay", "value": "enabled"}],
+                                        value=[],
+                                    ),
+                                    html.Div(
+                                        "⚠️Very Computationally Intensive (1H+ for 10 Nodes)",
+                                        style={"fontSize": "12px", "color": "#cbd5e1"},
+                                    ),
+                                ],
+                                style={"display": "flex", "flexDirection": "column", "gap": "8px", "marginTop": "10px"},
+                            ),
+                        ],
+                        id="rssi-calculations-section",
+                        open=False,
+                    ),
+                    html.Details(
+                        [
+                            html.Summary(
+                                "Viewshed Assessment",
+                                title="Place an assessment point on the map and compute a Max LOS heatmap around it.",
+                                style={"fontWeight": "600", "cursor": "pointer"},
+                            ),
+                            html.Div(
+                                [
+                                    html.Div(
+                                        "Place marker and select the radius and density of points to be assessed. A viewshed will be calculated for each of the sampling points to identify ideal locations for node placement.",
+                                        style={"fontSize": "12px", "color": "#cbd5e1"},
+                                    ),
+                                    html.Button(
+                                        "Place Assessment Point",
+                                        id="toggle-viewshed-point",
+                                        n_clicks=0,
+                                        style={"width": "100%"},
+                                        disabled=True,
+                                    ),
+                                    html.Button(
+                                        "Max Viewshed calculation",
+                                        id="run-viewshed-assessment",
+                                        n_clicks=0,
+                                        style={"width": "100%"},
+                                        disabled=True,
+                                    ),
+                                    html.Div("Assessment radius (meters)", style={"fontWeight": "600", "marginTop": "8px"}),
+                                    dcc.Slider(
+                                        25,
+                                        1000,
+                                        step=25,
+                                        value=int(VIEWSHED_ASSESSMENT_RADIUS_M),
+                                        marks={value: str(value) for value in (25, 100, 250, 500, 750, 1000)},
+                                        id="viewshed-radius",
+                                        disabled=True,
+                                        updatemode="mouseup",
+                                    ),
+                                    html.Div("Assessment height AGL (meters)", style={"fontWeight": "600", "marginTop": "4px"}),
+                                    dcc.Input(
+                                        id="viewshed-height-agl",
+                                        type="number",
+                                        min=0,
+                                        step=0.5,
+                                        value=VIEWSHED_ASSESSMENT_OBSERVER_HEIGHT_AGL_M,
+                                        style={"width": "100%"},
+                                        disabled=True,
+                                    ),
+                                    html.Div("Sampling density", style={"fontWeight": "600", "marginTop": "4px"}),
+                                    dcc.Slider(
+                                        min(VIEWSHED_SAMPLE_COUNT_OPTIONS),
+                                        max(VIEWSHED_SAMPLE_COUNT_OPTIONS),
+                                        step=None,
+                                        value=DEFAULT_VIEWSHED_SAMPLE_COUNT,
+                                        marks={value: str(value) for value in VIEWSHED_SAMPLE_COUNT_OPTIONS},
+                                        id="viewshed-sample-count",
+                                        disabled=True,
+                                        updatemode="mouseup",
+                                    ),
+                                    html.Div("Viewshed colormap", style={"fontWeight": "600", "marginTop": "8px"}),
+                                    dcc.Dropdown(
+                                        id="viewshed-colormap",
+                                        options=[{"label": value, "value": value} for value in VIEWSHED_COLOR_SCALE_OPTIONS],
+                                        value="Turbo",
+                                        clearable=False,
+                                        disabled=True,
+                                    ),
+                                    html.Div("Viewshed overlay opacity", style={"fontWeight": "600", "marginTop": "4px"}),
+                                    dcc.Slider(
+                                        0,
+                                        1,
+                                        step=0.05,
+                                        value=0.6,
+                                        id="viewshed-opacity",
+                                        disabled=True,
+                                        updatemode="mouseup",
+                                    ),
+                                    html.Button(
+                                        "Remove Assessment Point + Overlay",
+                                        id="clear-viewshed-assessment",
+                                        n_clicks=0,
+                                        style={
+                                            "width": "100%",
+                                            "backgroundColor": "#7f1d1d",
+                                            "borderColor": "#b91c1c",
+                                            "color": "#fee2e2",
+                                        },
+                                        disabled=True,
+                                    ),
+                                    html.Div(id="viewshed-assessment-status", style={"fontSize": "12px", "color": "#cbd5e1"}),
+                                ],
+                                style={"display": "flex", "flexDirection": "column", "gap": "8px", "marginTop": "10px"},
+                            ),
+                        ],
+                        id="viewshed-assessment-section",
+                        open=False,
                     ),
                 ],
-                style={"flex": "0 0 auto"},
+                className="app-main-column app-sidebar-column",
+                style={
+                    "width": "320px",
+                    "backgroundColor": "#111827",
+                    "padding": "16px",
+                    "display": "flex",
+                    "flexDirection": "column",
+                    "gap": "12px",
+                    "borderRadius": "8px",
+                    "border": "1px solid #374151",
+                    "color": "#e5e7eb",
+                    "flex": "0 0 auto",
+                },
             ),
             html.Div(
                 [
@@ -2826,8 +3823,14 @@ app.layout = [
                             html.Div(
                                 [
                                     html.Div(id="native-map", className="native-map-canvas"),
+                                    html.Div(id="native-map-bbox-selection", className="native-map-bbox-selection"),
                                     html.Div(id="native-map-path-overlay", className="native-map-path-overlay"),
                                     html.Div(id="native-map-legend", className="native-map-legend"),
+                                    html.Div(
+                                        "Move the cursor over the map to inspect coordinates, elevation, and RSSI.",
+                                        id="native-map-hover-readout",
+                                        className="native-map-hover-panel",
+                                    ),
                                     html.Div(id="native-map-render-ack", style={"display": "none"}),
                                 ],
                                 className="native-map-shell",
@@ -2858,11 +3861,6 @@ app.layout = [
                         ],
                         style={"position": "relative"},
                     ),
-                    html.Div(
-                        "Move the cursor over the map to inspect coordinates, elevation, and RSSI.",
-                        id="native-map-hover-readout",
-                        className="native-map-hover-panel",
-                    ),
                     html.Div(id="rssi-worker", style={"display": "none"}),
                     dcc.Loading(
                         dcc.Graph(
@@ -2875,6 +3873,7 @@ app.layout = [
                     ),
                     html.Div(id="path-profile-stats"),
                 ],
+                className="app-main-column app-map-column",
                 style={"flex": "1 1 auto", "minWidth": "0", "display": "flex", "flexDirection": "column", "gap": "16px"},
             ),
             html.Div(
@@ -2890,7 +3889,13 @@ app.layout = [
                             html.Summary("Click To Add Node", style={"fontWeight": "600", "cursor": "pointer"}),
                             html.Div(
                                 [
-                                    html.Button("Enable Click-To-Add", id="toggle-click-add", n_clicks=0, style={"width": "100%"}),
+                                    html.Button(
+                                        "Enable Click-To-Add",
+                                        id="toggle-click-add",
+                                        n_clicks=0,
+                                        style={"width": "100%"},
+                                        disabled=True,
+                                    ),
                                     html.Div(id="click-add-status", style={"fontSize": "12px", "color": "#cbd5e1"}),
                                 ],
                                 style={"display": "flex", "flexDirection": "column", "gap": "8px", "marginTop": "10px"},
@@ -2903,10 +3908,28 @@ app.layout = [
                             html.Summary("Manual Node Entry", style={"fontWeight": "600", "cursor": "pointer"}),
                             html.Div(
                                 [
-                                    dcc.Input(id="manual-node-name", type="text", placeholder="Node name", style={"width": "100%"}),
-                                    dcc.Input(id="manual-node-lon", type="number", placeholder="Longitude", style={"width": "100%"}),
-                                    dcc.Input(id="manual-node-lat", type="number", placeholder="Latitude", style={"width": "100%"}),
-                                    html.Button("Add Node", id="add-manual-node", n_clicks=0, style={"width": "100%"}),
+                                    dcc.Input(
+                                        id="manual-node-name",
+                                        type="text",
+                                        placeholder="Node name",
+                                        style={"width": "100%"},
+                                        disabled=True,
+                                    ),
+                                    dcc.Input(
+                                        id="manual-node-lon",
+                                        type="number",
+                                        placeholder="Longitude",
+                                        style={"width": "100%"},
+                                        disabled=True,
+                                    ),
+                                    dcc.Input(
+                                        id="manual-node-lat",
+                                        type="number",
+                                        placeholder="Latitude",
+                                        style={"width": "100%"},
+                                        disabled=True,
+                                    ),
+                                    html.Button("Add Node", id="add-manual-node", n_clicks=0, style={"width": "100%"}, disabled=True),
                                 ],
                                 style={"display": "flex", "flexDirection": "column", "gap": "8px", "marginTop": "10px"},
                             ),
@@ -2915,11 +3938,7 @@ app.layout = [
                     ),
                     html.Div(
                         dcc.Loading(html.Div(id="node-summary"), type="default"),
-                        style={
-                            "maxHeight": "480px",
-                            "overflowY": "auto",
-                            "paddingRight": "4px",
-                        },
+                        style={"paddingRight": "4px"},
                     ),
                     html.Details(
                         [
@@ -2936,6 +3955,7 @@ app.layout = [
                         open=False,
                     ),
                 ],
+                className="app-main-column app-sidebar-column",
                 style={
                     "width": "320px",
                     "backgroundColor": "#111827",
@@ -2950,7 +3970,8 @@ app.layout = [
                 },
             ),
         ],
-        style={"display": "flex", "alignItems": "flex-start", "gap": "20px", "padding": "0 20px 20px"},
+        className="app-main-layout",
+        style={"display": "flex", "alignItems": "stretch", "gap": "20px", "padding": "0 20px 20px"},
     ),
 ]
 
@@ -2964,6 +3985,76 @@ app.layout = [
 )
 def clear_node_upload_selection(_reset_revision):
     return None, None, None
+
+
+@app.callback(
+    Output("terrain-ready-store", "data"),
+    Input("native-map-spec-store", "data"),
+    State("terrain-ready-store", "data"),
+)
+def update_terrain_ready_store(spec, current_value):
+    if current_value:
+        return True
+    if spec and spec.get("terrain_dem") is not None:
+        return True
+    return False
+
+
+@app.callback(
+    Output("toggle-click-add", "disabled"),
+    Output("manual-node-name", "disabled"),
+    Output("manual-node-lon", "disabled"),
+    Output("manual-node-lat", "disabled"),
+    Output("add-manual-node", "disabled"),
+    Output("node-upload", "disabled"),
+    Output("load-nodes-button", "disabled"),
+    Output("elevation_alpha", "disabled"),
+    Output("elevation_clip_range", "disabled"),
+    Output("clip-visible-elevation-range", "disabled"),
+    Output("worldcover-display", "options"),
+    Output("worldcover-opacity", "disabled"),
+    Output("draw-rssi-overlay", "disabled"),
+    Input("terrain-ready-store", "data"),
+)
+def update_locked_control_state(terrain_ready):
+    disabled = not bool(terrain_ready)
+    worldcover_options = [{"label": " Show WorldCover layer", "value": "enabled", "disabled": disabled}]
+    return (
+        disabled,
+        disabled,
+        disabled,
+        disabled,
+        disabled,
+        disabled,
+        disabled,
+        disabled,
+        disabled,
+        disabled,
+        worldcover_options,
+        disabled,
+        disabled,
+    )
+
+
+@app.callback(
+    Output("bbox-preview-store", "data"),
+    Input("min_lon", "value"),
+    Input("min_lat", "value"),
+    Input("max_lon", "value"),
+    Input("max_lat", "value"),
+)
+def update_bbox_preview_store(min_lon, min_lat, max_lon, max_lat):
+    try:
+        return bbox_dict(
+            {
+                "min_lon": min_lon,
+                "min_lat": min_lat,
+                "max_lon": max_lon,
+                "max_lat": max_lat,
+            }
+        )
+    except Exception:
+        raise PreventUpdate
 
 
 @app.callback(
@@ -3140,7 +4231,7 @@ def update_click_add_text(click_mode):
         click_mode,
         "add-node",
         "Disable Click-To-Add",
-        "Click on the map to add nodes. This mode stays active until you disable it.",
+        "Click on the map to add one node. This mode turns off after a successful add.",
         "Enable Click-To-Add",
         "Click-to-add is off.",
     )
@@ -3155,11 +4246,155 @@ def update_terrain_bbox_text(click_mode):
     return click_mode_button_copy(
         click_mode,
         "terrain-bbox",
-        "Cancel Terrain Load Box Selection",
-        "Pan or zoom the native map to the desired area. The next viewport change fills the terrain load bounds.",
-        "Set Terrain Load Box From View",
-        "Use this to copy the next native map viewport into the terrain load bounds.",
+        "Cancel Terrain Bounding Box Selection",
+        "Drag a box on the native map. Release to fill the terrain bounding box.",
+        "Set Terrain Bounding Box",
+        "Use this to drag out the terrain bounding box directly on the map.",
     )
+
+
+@app.callback(
+    Output("map-click-mode-store", "data", allow_duplicate=True),
+    Input("toggle-viewshed-point", "n_clicks"),
+    State("map-click-mode-store", "data"),
+    prevent_initial_call=True,
+)
+def toggle_viewshed_point_mode(_n_clicks, click_mode):
+    return toggle_click_mode_state(click_mode, "viewshed-point")
+
+
+@app.callback(
+    Output("toggle-viewshed-point", "children"),
+    Output("toggle-viewshed-point", "disabled"),
+    Output("run-viewshed-assessment", "disabled"),
+    Output("clear-viewshed-assessment", "disabled"),
+    Output("viewshed-radius", "disabled"),
+    Output("viewshed-height-agl", "disabled"),
+    Output("viewshed-sample-count", "disabled"),
+    Output("viewshed-colormap", "disabled"),
+    Output("viewshed-opacity", "disabled"),
+    Output("viewshed-assessment-status", "children"),
+    Input("map-click-mode-store", "data"),
+    Input("viewshed-point-store", "data"),
+    Input("viewshed-assessment-store", "data"),
+    Input("terrain-ready-store", "data"),
+    Input("bbox-store", "data"),
+    Input("viewshed-radius", "value"),
+    Input("viewshed-height-agl", "value"),
+    Input("viewshed-sample-count", "value"),
+)
+def update_viewshed_controls(
+    click_mode,
+    point_data,
+    assessment_store,
+    terrain_ready,
+    bbox_data,
+    viewshed_radius,
+    viewshed_height_agl,
+    viewshed_sample_count,
+):
+    mode_active = click_mode_value(click_mode) == "viewshed-point"
+    terrain_ready = bool(terrain_ready)
+    has_point = bool(point_data and point_data.get("longitude") is not None and point_data.get("latitude") is not None)
+    viewshed_radius = float(viewshed_radius or VIEWSHED_ASSESSMENT_RADIUS_M)
+    viewshed_height_agl = float(viewshed_height_agl or 0.0)
+    effective_sample_count = effective_viewshed_sample_count(viewshed_sample_count)
+    current_bundle_key = None
+    if bbox_data:
+        try:
+            current_bundle_key = normalize_bbox(
+                bbox_data["min_lon"],
+                bbox_data["min_lat"],
+                bbox_data["max_lon"],
+                bbox_data["max_lat"],
+            )
+        except Exception:
+            current_bundle_key = None
+    radius_matches = bool(
+        assessment_store
+        and assessment_store.get("radius_m") is not None
+        and math.isclose(float(assessment_store["radius_m"]), viewshed_radius, rel_tol=0.0, abs_tol=1e-6)
+    )
+    height_matches = bool(
+        assessment_store
+        and assessment_store.get("observer_height_agl") is not None
+        and math.isclose(
+            float(assessment_store["observer_height_agl"]),
+            viewshed_height_agl,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+    )
+    sample_count_matches = bool(
+        assessment_store
+        and assessment_store.get("sample_count") is not None
+        and int(assessment_store["sample_count"]) == int(effective_sample_count)
+    )
+    has_current_assessment = bool(
+        assessment_store
+        and assessment_store.get("cache_key")
+        and radius_matches
+        and height_matches
+        and sample_count_matches
+        and current_bundle_key is not None
+        and tuple(assessment_store.get("bundle_key", ())) == tuple(current_bundle_key)
+    )
+    button_label = "Cancel Assessment Point Placement" if mode_active else "Place Assessment Point"
+
+    if not terrain_ready:
+        status = "Load terrain before running a viewshed assessment."
+    elif assessment_store and assessment_store.get("error"):
+        status = str(assessment_store.get("error"))
+    elif mode_active:
+        status = "Click once on the map to place the viewshed assessment point."
+    elif has_point and has_current_assessment:
+        status = (
+            f"Assessment point set at ({float(point_data['longitude']):.5f}, "
+            f"{float(point_data['latitude']):.5f}) with a {int(round(viewshed_radius))} m radius at "
+            f"{viewshed_height_agl:.1f} m AGL using {effective_sample_count} samples. Max LOS overlay is displayed."
+        )
+    elif has_point and assessment_store and assessment_store.get("cache_key"):
+        status = (
+            f"Assessment point set at ({float(point_data['longitude']):.5f}, "
+            f"{float(point_data['latitude']):.5f}). Re-run Max LOS calculation for the current terrain, "
+            f"{int(round(viewshed_radius))} m radius, {viewshed_height_agl:.1f} m AGL, and {effective_sample_count} samples."
+        )
+    elif has_point:
+        status = (
+            f"Assessment point set at ({float(point_data['longitude']):.5f}, "
+            f"{float(point_data['latitude']):.5f}). Click Max LOS calculation to generate the "
+            f"{int(round(viewshed_radius))} m overlay at {viewshed_height_agl:.1f} m AGL using {effective_sample_count} samples."
+        )
+    else:
+        status = (
+            f"No viewshed assessment point placed. Current radius is {int(round(viewshed_radius))} m "
+            f"at {viewshed_height_agl:.1f} m AGL using {effective_sample_count} samples."
+        )
+    return (
+        button_label,
+        not terrain_ready,
+        (not terrain_ready) or (not has_point),
+        (not has_point) and not bool(assessment_store and assessment_store.get("cache_key")),
+        not terrain_ready,
+        not terrain_ready,
+        not terrain_ready,
+        not has_current_assessment,
+        not has_current_assessment,
+        status,
+    )
+
+
+@app.callback(
+    Output("viewshed-point-store", "data", allow_duplicate=True),
+    Output("viewshed-assessment-store", "data", allow_duplicate=True),
+    Output("map-click-mode-store", "data", allow_duplicate=True),
+    Input("clear-viewshed-assessment", "n_clicks"),
+    prevent_initial_call=True,
+)
+def clear_viewshed_assessment(_n_clicks):
+    if not _n_clicks:
+        raise PreventUpdate
+    return None, None, {"mode": "none", "node_id": None}
 
 
 @app.callback(
@@ -3222,6 +4457,8 @@ def update_selected_nodes(_n_clicks, selected_node_ids, nodes):
 
 @app.callback(
     Output("map-click-mode-store", "data", allow_duplicate=True),
+    Output("selected-node-ids-store", "data", allow_duplicate=True),
+    Output("point-path-store", "data", allow_duplicate=True),
     Output("node-action-message", "children", allow_duplicate=True),
     Input("draw-point-path", "n_clicks"),
     Input({"type": "move-node-button", "node_id": ALL}, "n_clicks"),
@@ -3240,11 +4477,11 @@ def update_map_click_mode(draw_point_clicks, _move_clicks, selected_node_ids, no
         primary_id = str(selected_node_ids[-1]) if selected_node_ids else None
         primary = find_node(normalized_nodes, primary_id)
         if primary is None:
-            return no_update, "Select a primary node before drawing a path to a map point."
+            return no_update, no_update, no_update, "Select a primary node before drawing a path to a map point."
         return {
             "mode": "point-path",
             "node_id": str(primary["id"]),
-        }, f"Click once on the map to trace from {primary['name']}."
+        }, [str(primary["id"])], None, f"Click once on the map to trace from {primary['name']}."
 
     if isinstance(triggered, dict) and triggered.get("type") == "move-node-button":
         if not ctx.triggered or not ctx.triggered[0].get("value"):
@@ -3255,7 +4492,7 @@ def update_map_click_mode(draw_point_clicks, _move_clicks, selected_node_ids, no
         return {
             "mode": "move-node",
             "node_id": str(node["id"]),
-        }, f"Click once on the map to move {node['name']}."
+        }, no_update, no_update, f"Click once on the map to move {node['name']}."
 
     raise PreventUpdate
 
@@ -3521,15 +4758,25 @@ def save_nodes_csv(_n_clicks, nodes):
     Output("native-map-spec-store", "data"),
     Output("native-map-legend", "children"),
     Input("bbox-store", "data"),
+    Input("bbox-preview-store", "data"),
+    Input("viewshed-point-store", "data"),
+    Input("viewshed-assessment-store", "data"),
     Input("nodes-store", "data"),
     Input("selected-node-ids-store", "data"),
-    Input("elevation_alpha", "value"),
     Input("elevation_clip_range", "value"),
+    Input("elevation_alpha", "value"),
+    Input("worldcover-opacity", "value"),
+    Input("viewshed-opacity", "value"),
+    Input("viewshed-radius", "value"),
+    Input("viewshed-height-agl", "value"),
+    Input("viewshed-sample-count", "value"),
+    Input("rssi-opacity", "value"),
+    Input("worldcover-display", "value"),
     Input("base-map-style", "value"),
     Input("elevation-colormap", "value"),
+    Input("viewshed-colormap", "value"),
     Input("rssi-calculation-store", "data"),
     Input("rssi-overlay-selection-store", "data"),
-    Input("rssi-opacity", "value"),
     Input("rssi-colormap", "value"),
     Input("rssi-render-mode", "value"),
     Input("point-path-store", "data"),
@@ -3538,15 +4785,25 @@ def save_nodes_csv(_n_clicks, nodes):
 )
 def update_native_map_spec(
     bbox_data,
+    bbox_preview_data,
+    viewshed_point_data,
+    viewshed_assessment_store,
     nodes,
     selected_node_ids,
-    terrain_alpha,
     terrain_clip_range,
+    terrain_alpha,
+    worldcover_opacity,
+    viewshed_opacity,
+    viewshed_radius,
+    viewshed_height_agl,
+    viewshed_sample_count,
+    rssi_opacity,
+    worldcover_display,
     base_map_style,
     elevation_colormap,
+    viewshed_colormap,
     rssi_calculation_store,
     rssi_overlay_selection_store,
-    rssi_opacity,
     rssi_colormap,
     rssi_render_mode,
     point_path_data,
@@ -3554,10 +4811,39 @@ def update_native_map_spec(
     global_rx_gain_dbi,
 ):
     nodes = list(nodes or [])
-    overlay_context_key = native_map_overlay_context_key(nodes, selected_node_ids, point_path_data)
+    overlay_context_key = native_map_overlay_context_key(
+        nodes,
+        selected_node_ids,
+        point_path_data,
+        viewshed_point_data,
+        viewshed_assessment_store,
+    )
+    visual_context_key = native_map_visual_context_key(
+        bbox_data,
+        terrain_alpha,
+        terrain_clip_range,
+        worldcover_display,
+        worldcover_opacity,
+        base_map_style,
+        elevation_colormap,
+        rssi_calculation_store,
+        rssi_overlay_selection_store,
+        rssi_opacity,
+        rssi_colormap,
+        rssi_render_mode,
+        {
+            "viewshed_opacity": viewshed_opacity,
+            "viewshed_colormap": viewshed_colormap,
+            "viewshed_radius": viewshed_radius,
+            "viewshed_height_agl": viewshed_height_agl,
+            "viewshed_sample_count": viewshed_sample_count,
+        },
+    )
     try:
         bundle = None
         rssi_overlay = None
+        viewshed_overlay = None
+        bbox_outline = bbox_preview_data or bbox_data
 
         if bbox_data:
             terrain_bbox = normalize_bbox(
@@ -3576,6 +4862,13 @@ def update_native_map_spec(
                 )
             else:
                 rssi_overlay = resolve_rssi_overlay(bundle, nodes, rssi_calculation_store, rssi_overlay_selection_store or {})
+            viewshed_overlay = resolve_viewshed_assessment(
+                bundle,
+                viewshed_assessment_store,
+                viewshed_radius,
+                viewshed_height_agl,
+                effective_viewshed_sample_count(viewshed_sample_count),
+            )
 
         path_overlay = compute_native_map_path_overlay(
             nodes,
@@ -3589,19 +4882,33 @@ def update_native_map_spec(
         spec = build_native_map_spec(
             bundle,
             nodes,
-            terrain_alpha or 0.0,
+            0.0 if terrain_alpha is None else float(terrain_alpha),
             terrain_clip_range=terrain_clip_range,
             elevation_colorscale=elevation_colormap or "Magma",
+            worldcover_enabled="enabled" in (worldcover_display or []),
+            worldcover_opacity=0.0 if worldcover_opacity is None else float(worldcover_opacity),
+            viewshed_point_data=viewshed_point_data,
+            viewshed_radius_m=viewshed_radius,
+            viewshed_sample_count=viewshed_sample_count,
+            viewshed_overlay=viewshed_overlay,
+            viewshed_colorscale=viewshed_colormap or "Turbo",
+            viewshed_opacity=0.0 if viewshed_opacity is None else float(viewshed_opacity),
             rssi_overlay=rssi_overlay,
             rssi_colorscale=rssi_colormap or "Turbo",
-            loaded_bbox=bbox_data,
+            loaded_bbox=bbox_outline,
             selected_node_ids=selected_node_ids,
             base_map_style=base_map_style or "satellite",
-            rssi_opacity=rssi_opacity or 0.55,
+            rssi_opacity=0.55 if rssi_opacity is None else float(rssi_opacity),
             path_overlay=path_overlay,
             overlay_context_key=overlay_context_key,
+            visual_context_key=visual_context_key,
         )
-        legends = build_native_map_legends(spec.get("terrain_legend"), spec.get("rssi_legend"))
+        legends = build_native_map_legends(
+            spec.get("terrain_legend"),
+            spec.get("worldcover_legend"),
+            spec.get("rssi_legend"),
+            spec.get("viewshed_legend"),
+        )
         return spec, legends
     except Exception as exc:
         try:
@@ -3621,19 +4928,26 @@ def update_native_map_spec(
             "base_style": build_maplibre_style(base_map_style),
             "terrain_dem": None,
             "terrain_layer": None,
+            "worldcover_layer": None,
+            "viewshed_layer": None,
             "rssi_layer": None,
             "nodes": build_node_feature_collection(nodes, selected_node_ids),
-            "loaded_bbox": build_loaded_bbox_feature_collection(loaded_bbox=bbox_data),
+            "viewshed_point": build_viewshed_point_feature_collection(viewshed_point_data),
+            "viewshed_radius_outline": build_viewshed_radius_feature_collection(viewshed_point_data, viewshed_radius),
+            "viewshed_samples": build_viewshed_sample_feature_collection(viewshed_point_data, viewshed_radius, viewshed_sample_count),
+            "loaded_bbox": build_loaded_bbox_feature_collection(loaded_bbox=bbox_outline),
             "path_line": fallback_path_overlay.get("line", feature_collection()),
             "attenuation_points": fallback_path_overlay.get("attenuation_points", feature_collection()),
             "terrain_block_points": fallback_path_overlay.get("terrain_block_points", feature_collection()),
             "terrain_legend": None,
+            "worldcover_legend": None,
+            "viewshed_legend": None,
             "rssi_legend": None,
             "overlay_context_key": overlay_context_key,
+            "visual_context_key": visual_context_key,
             "error": f"Failed to refresh native map overlays: {exc}",
         }
         return fallback_spec, html.Div()
-
 
 app.clientside_callback(
     ClientsideFunction(namespace="clientside", function_name="renderNativeMap"),
@@ -3646,8 +4960,9 @@ app.clientside_callback(
     Input("selected-node-ids-store", "data"),
     Input("point-path-store", "data"),
     Input("map-click-mode-store", "data"),
+    State("viewshed-point-store", "data"),
+    State("viewshed-assessment-store", "data"),
 )
-
 
 @app.callback(
     Output("map-interaction-loading-store", "data", allow_duplicate=True),
@@ -3662,6 +4977,16 @@ def start_map_loading(_n_clicks):
 @app.callback(
     Output("map-interaction-loading-store", "data", allow_duplicate=True),
     Output("map-interaction-loading-message-store", "data", allow_duplicate=True),
+    Input("run-viewshed-assessment", "n_clicks"),
+    prevent_initial_call=True,
+)
+def start_viewshed_loading(_n_clicks):
+    return True, "Computing Max LOS assessment..."
+
+
+@app.callback(
+    Output("map-interaction-loading-store", "data", allow_duplicate=True),
+    Output("map-interaction-loading-message-store", "data", allow_duplicate=True),
     Input("native-map-render-ack", "children"),
     State("map-interaction-loading-store", "data"),
     prevent_initial_call=True,
@@ -3670,6 +4995,43 @@ def clear_map_interaction_loading(_ack, is_loading):
     if is_loading:
         return False, DEFAULT_MAP_LOADING_MESSAGE
     raise PreventUpdate
+
+
+@app.callback(
+    Output("terrain-load-notification-store", "data"),
+    Input("native-map-render-ack", "children"),
+    State("map-interaction-loading-store", "data"),
+    State("map-interaction-loading-message-store", "data"),
+    State("bbox-store", "data"),
+    State("terrain-load-notification-store", "data"),
+    prevent_initial_call=True,
+)
+def notify_terrain_load_complete(_ack, is_loading, loading_message, bbox_data, notification_state):
+    if not is_loading or str(loading_message or "") != DEFAULT_MAP_LOADING_MESSAGE:
+        raise PreventUpdate
+    ack_value = str(_ack or "")
+    current_state = notification_state or {}
+    if not ack_value or current_state.get("ack") == ack_value:
+        raise PreventUpdate
+
+    message = "Elevation and WorldCover data finished loading."
+    if bbox_data:
+        try:
+            bbox = normalize_bbox(
+                bbox_data["min_lon"],
+                bbox_data["min_lat"],
+                bbox_data["max_lon"],
+                bbox_data["max_lat"],
+            )
+            message = (
+                "Elevation and WorldCover data finished loading for "
+                f"({bbox[0]:.4f}, {bbox[1]:.4f}) to ({bbox[2]:.4f}, {bbox[3]:.4f})."
+            )
+        except Exception:
+            pass
+
+    send_desktop_notification("Terrain Load Complete", message)
+    return {"ack": ack_value}
 
 
 @app.callback(
@@ -3760,6 +5122,75 @@ def update_native_map_hover_readout(hover_data, bbox_data, nodes, calculation_st
         rows.append(html.Div(f"Added loss {float(feature.get('added_loss_db', 0.0)):.2f} dB"))
 
     return rows
+
+
+@app.callback(
+    Output("viewshed-assessment-store", "data"),
+    Output("map-click-mode-store", "data", allow_duplicate=True),
+    Input("run-viewshed-assessment", "n_clicks"),
+    State("viewshed-point-store", "data"),
+    State("bbox-store", "data"),
+    State("viewshed-radius", "value"),
+    State("viewshed-height-agl", "value"),
+    State("viewshed-sample-count", "value"),
+    prevent_initial_call=True,
+)
+def generate_viewshed_assessment(
+    run_clicks,
+    point_data,
+    bbox_data,
+    viewshed_radius,
+    viewshed_height_agl,
+    viewshed_sample_count,
+):
+    if not run_clicks:
+        raise PreventUpdate
+    if not point_data or point_data.get("longitude") is None or point_data.get("latitude") is None:
+        return {"error": "Place a viewshed assessment point before running Max LOS calculation."}, no_update
+    if not bbox_data:
+        return {"error": "Load elevation + worldcover data before running Max LOS calculation."}, {"mode": "none", "node_id": None}
+    viewshed_radius = float(viewshed_radius or VIEWSHED_ASSESSMENT_RADIUS_M)
+    viewshed_height_agl = float(viewshed_height_agl or VIEWSHED_ASSESSMENT_OBSERVER_HEIGHT_AGL_M)
+    effective_sample_count = effective_viewshed_sample_count(viewshed_sample_count)
+
+    try:
+        bbox = normalize_bbox(
+            bbox_data["min_lon"],
+            bbox_data["min_lat"],
+            bbox_data["max_lon"],
+            bbox_data["max_lat"],
+        )
+        bundle = get_map_bundle(*bbox)
+        cache_key, result = compute_viewshed_assessment(
+            point_data,
+            bundle,
+            radius_m=viewshed_radius,
+            observer_height_agl=viewshed_height_agl,
+            sample_count=effective_sample_count,
+        )
+        if not cache_key or result is None:
+            return {"error": "Max LOS calculation did not produce any visible-cell values."}, {"mode": "none", "node_id": None}
+        send_desktop_notification(
+            "Viewshed Assessment Complete",
+            (
+                f"Computed Max LOS for {int(round(viewshed_radius))} m radius at "
+                f"{viewshed_height_agl:.1f} m AGL using {int(effective_sample_count)} samples."
+            ),
+        )
+        return {
+            "request_id": int(run_clicks),
+            "bundle_key": list(bundle["cache_key"]),
+            "cache_key": cache_key,
+            "radius_m": float(viewshed_radius),
+            "observer_height_agl": float(viewshed_height_agl),
+            "sample_count": int(effective_sample_count),
+            "point": {
+                "longitude": float(point_data["longitude"]),
+                "latitude": float(point_data["latitude"]),
+            },
+        }, {"mode": "none", "node_id": None}
+    except Exception as exc:
+        return {"error": f"Max LOS calculation failed: {exc}"}, {"mode": "none", "node_id": None}
 
 
 @app.callback(
@@ -3875,6 +5306,13 @@ def generate_rssi_overlay(
         for node in nodes
     }
     mode = "with path attenuation" if include_ground_loss else "with viewshed + FSPL only"
+    send_desktop_notification(
+        "RSSI Overlay Complete",
+        (
+            f"Computed RSSI overlay for {len(nodes)} nodes {mode} at "
+            f"{float(rx_height):.1f} m AGL / {float(rx_gain):.1f} dBi."
+        ),
+    )
     return (
         calc_store,
         overlay_selection,
@@ -3926,12 +5364,14 @@ app.clientside_callback(
 
 
 @app.callback(
+    Output("terrain-overlay-section", "open"),
     Output("map-bounds-section", "open"),
+    Output("rssi-calculations-section", "open"),
     Input("update_graph", "n_clicks"),
     prevent_initial_call=True,
 )
 def collapse_map_bounds(_n_clicks):
-    return False
+    return True, False, True
 
 
 @app.callback(
@@ -3980,6 +5420,49 @@ def update_path_profile(point_path_data, selected_node_ids, nodes, bbox_data, gl
     except Exception as exc:
         return empty_path_profile_figure(f"Path profile unavailable: {exc}"), html.Div()
 
+    if point_path_data:
+        source = find_node(nodes, point_path_data.get("source_node_id"))
+        target_lon = point_path_data.get("target_longitude")
+        target_lat = point_path_data.get("target_latitude")
+        if source is not None and target_lon is not None and target_lat is not None:
+            result = compute_path_loss(
+                (source["longitude"], source["latitude"]),
+                (float(target_lon), float(target_lat)),
+                tx_height=source["height_agl_m"],
+                rx_height=float(global_rx_height_agl or DEFAULT_NODE_HEIGHT_M),
+                tx_power_dbm=source["tx_power_dbm"],
+                tx_gain_dbi=source["antenna_gain_dbi"],
+                rx_gain_dbi=float(global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI),
+            )
+            stats = [
+                f"Path: {source['name']} -> Map Point",
+                f"Endpoint: {float(target_lon):.5f}, {float(target_lat):.5f}",
+                f"RSSI: {result['rssi_dbm']:.1f} dBm",
+                f"Distance: {result['link_distance_km']:.2f} km",
+                f"Path attenuation: {result['path_loss_db']:.1f} dB",
+                f"Attenuation events: {result['attenuation_event_count']}",
+                f"Terrain collision events: {result['terrain_collision_event_count']}",
+                f"Direct LOS collisions: {result['direct_los_collision_count']}",
+                (
+                    f"Source TX height/gain/power: {source['height_agl_m']:.1f} m / "
+                    f"{source['antenna_gain_dbi']:.1f} dBi / {source['tx_power_dbm']:.1f} dBm"
+                ),
+                (
+                    f"Global RX height/gain: {float(global_rx_height_agl or DEFAULT_NODE_HEIGHT_M):.1f} m / "
+                    f"{float(global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI):.1f} dBi"
+                ),
+            ]
+            return (
+                build_path_profile_figure(
+                    source["name"],
+                    "Map Point",
+                    result,
+                    source_color=color_lookup.get(str(source["id"]), "#22c55e"),
+                    target_color="#f59e0b",
+                ),
+                build_stats_panel(stats),
+            )
+
     if len(selected_node_ids) == 2:
         primary_node_id = selected_node_ids[-1]
         secondary_node_id = selected_node_ids[0]
@@ -4025,51 +5508,8 @@ def update_path_profile(point_path_data, selected_node_ids, nodes, bbox_data, gl
             build_stats_panel(stats),
         )
 
-    if point_path_data:
-        source = find_node(nodes, point_path_data.get("source_node_id"))
-        target_lon = point_path_data.get("target_longitude")
-        target_lat = point_path_data.get("target_latitude")
-        if source is not None and target_lon is not None and target_lat is not None:
-            result = compute_path_loss(
-                (source["longitude"], source["latitude"]),
-                (float(target_lon), float(target_lat)),
-                tx_height=source["height_agl_m"],
-                rx_height=float(global_rx_height_agl or DEFAULT_NODE_HEIGHT_M),
-                tx_power_dbm=source["tx_power_dbm"],
-                tx_gain_dbi=source["antenna_gain_dbi"],
-                rx_gain_dbi=float(global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI),
-            )
-            stats = [
-                f"Path: {source['name']} -> Map Point",
-                f"Endpoint: {float(target_lon):.5f}, {float(target_lat):.5f}",
-                f"RSSI: {result['rssi_dbm']:.1f} dBm",
-                f"Distance: {result['link_distance_km']:.2f} km",
-                f"Path attenuation: {result['path_loss_db']:.1f} dB",
-                f"Attenuation events: {result['attenuation_event_count']}",
-                f"Terrain collision events: {result['terrain_collision_event_count']}",
-                f"Direct LOS collisions: {result['direct_los_collision_count']}",
-                (
-                    f"Source TX height/gain/power: {source['height_agl_m']:.1f} m / "
-                    f"{source['antenna_gain_dbi']:.1f} dBi / {source['tx_power_dbm']:.1f} dBm"
-                ),
-                (
-                    f"Global RX height/gain: {float(global_rx_height_agl or DEFAULT_NODE_HEIGHT_M):.1f} m / "
-                    f"{float(global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI):.1f} dBi"
-                ),
-            ]
-            return (
-                build_path_profile_figure(
-                    source["name"],
-                    "Map Point",
-                    result,
-                    source_color=color_lookup.get(str(source["id"]), "#22c55e"),
-                    target_color="#f59e0b",
-                ),
-                build_stats_panel(stats),
-            )
-
     return empty_path_profile_figure("Select exactly two nodes or use Draw Path To Map Point to inspect the path profile."), html.Div()
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False)
