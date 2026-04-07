@@ -38,7 +38,7 @@ python app.py
 ```
 git clone https://github.com/lucasbinder/mesh_terrain.git
 cd mesh_terrain
-py -3.14 -m venv meshterrain_env
+py -3.14 -m venv meshterrain_venv
 meshterrain_venv\Scripts\activate.bat
 pip install -r requirements.txt
 python app.py
@@ -116,9 +116,7 @@ Single click to pan, scroll to zoom, and right click to rotate around terrain
 - With nodes added to the map, press `Draw RSSI For All Nodes` to perform RSSI calculations 
   - This may take a minute – if you enabled notifications, you will receive one when calculations are complete
 - Set the RX Height AGL and RX Antenna Gain to test different receiver node profiles
-- NOT RECOMMENDED: `Include per-cell path attenuation in RSSI overlay` will enable prediction of signal attenuation using the WorldCover dataset for all sheds included in a Node's viewshed
-  - This is incredibly computationally intensive but can improve the quality of results
-  - Expect to wait upwards of an hour for 10 nodes, even on a powerful computer
+- `Include per-cell path attenuation in RSSI overlay` will enable prediction of signal attenuation using the WorldCover dataset for all sheds included in a Node's viewshed
 
 #### Visualization
 - After calculating RSSI, the Max RSSI (default) will be displayed on the map

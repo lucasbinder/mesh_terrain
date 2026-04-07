@@ -1081,6 +1081,7 @@
       return;
     }
     const rasterOpacity = layerSpec.opacity === undefined || layerSpec.opacity === null ? 1.0 : Number(layerSpec.opacity);
+    const rasterResampling = layerSpec.resampling === "nearest" ? "nearest" : "linear";
     const sourceSignature = JSON.stringify({
       image: String(layerSpec.image),
       coordinates: layerSpec.coordinates,
@@ -1116,6 +1117,7 @@
       paint: {
         "raster-opacity": rasterOpacity,
         "raster-fade-duration": 0,
+        "raster-resampling": rasterResampling,
       },
     }, beforeId);
     if (state && state.imageLayerState) {

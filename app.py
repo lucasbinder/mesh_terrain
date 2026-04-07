@@ -21,11 +21,21 @@ from PIL import Image, ImageColor
 from dash import ALL, ClientsideFunction, Dash, Input, Output, State, ctx, dcc, html, no_update
 from dash.exceptions import PreventUpdate
 from flask import Response
+try:
+    from numba import njit, prange
+except ModuleNotFoundError:
+    njit = None
+    prange = range
 from plotly.colors import qualitative, sample_colorscale
 from rasterio.errors import NotGeoreferencedWarning
 from rasterio.io import MemoryFile
 from rasterio.warp import Resampling, reproject, transform, transform_bounds
 from scipy.interpolate import RBFInterpolator
+try:
+    from tqdm import tqdm
+except ModuleNotFoundError:
+    def tqdm(iterable=None, **_kwargs):
+        return iterable
 from xrspatial import viewshed
 
 try:
@@ -62,6 +72,10 @@ DEFAULT_TX_POWER_DBM = 30.0
 DEFAULT_TX_GAIN_DBI = 6.0
 DEFAULT_RX_GAIN_DBI = 2.0
 DEFAULT_OTHER_LOSSES_DB = 3.0
+RSSI_PATH_SAMPLE_SPACING_MIN_M = 25.0
+RSSI_PATH_SAMPLE_SPACING_MAX_M = 200.0
+RSSI_PATH_SAMPLE_SPACING_STEP_M = 25.0
+DEFAULT_RSSI_PATH_SAMPLE_SPACING_M = 100.0
 MIN_LINK_RSSI_DBM = -140.0
 VIEWSHED_ASSESSMENT_RADIUS_M = 100.0
 VIEWSHED_ASSESSMENT_OBSERVER_HEIGHT_AGL_M = 0.0
@@ -164,8 +178,41 @@ ATTENUATION = {
     100: 0,
 }
 
-V_OFFSET = np.vectorize(lambda value: OFFSETS.get(int(value), 0), otypes=[np.float32])
-V_ATTENUATION = np.vectorize(lambda value: ATTENUATION.get(int(value), 0), otypes=[np.float32])
+
+def maybe_njit(*args, **kwargs):
+    def decorator(func):
+        if njit is None:
+            return func
+        return njit(*args, **kwargs)(func)
+
+    return decorator
+
+
+def build_worldcover_lookup(mapping):
+    lookup = np.zeros(256, dtype=np.float32)
+    for code, value in mapping.items():
+        index = int(code)
+        if 0 <= index < lookup.shape[0]:
+            lookup[index] = float(value)
+    return lookup
+
+
+OFFSET_LOOKUP = build_worldcover_lookup(OFFSETS)
+ATTENUATION_LOOKUP = build_worldcover_lookup(ATTENUATION)
+
+
+def worldcover_lookup(values, lookup):
+    classes = np.asarray(values, dtype=np.int16)
+    clipped = np.clip(classes, 0, lookup.shape[0] - 1).astype(np.intp, copy=False)
+    return lookup[clipped]
+
+
+def V_OFFSET(values):
+    return worldcover_lookup(values, OFFSET_LOOKUP)
+
+
+def V_ATTENUATION(values):
+    return worldcover_lookup(values, ATTENUATION_LOOKUP)
 
 ANALYSIS_CONTEXT = {}
 ANALYSIS_KEY = None
@@ -428,6 +475,16 @@ def bbox_dict(bounds):
 
 def next_revision(current_revision):
     return int(current_revision or 0) + 1
+
+
+def normalize_rssi_path_sample_spacing(sample_spacing_m):
+    if sample_spacing_m is None:
+        value = DEFAULT_RSSI_PATH_SAMPLE_SPACING_M
+    else:
+        value = float(sample_spacing_m)
+    value = min(max(value, RSSI_PATH_SAMPLE_SPACING_MIN_M), RSSI_PATH_SAMPLE_SPACING_MAX_M)
+    steps = round((value - RSSI_PATH_SAMPLE_SPACING_MIN_M) / RSSI_PATH_SAMPLE_SPACING_STEP_M)
+    return float(RSSI_PATH_SAMPLE_SPACING_MIN_M + steps * RSSI_PATH_SAMPLE_SPACING_STEP_M)
 
 
 def click_mode_value(click_mode):
@@ -1326,6 +1383,7 @@ def build_native_map_spec(
                 "image": rssi_uri,
                 "coordinates": raster_layer_coordinates(bundle["terrain_display_bounds"]),
                 "opacity": 1.0,
+                "resampling": "nearest",
             }
 
     return {
@@ -1883,6 +1941,205 @@ def snap_point(x_coord, y_coord):
     return row, col, float(terrain_x[col]), float(terrain_y[row]), float(terrain_values[row, col])
 
 
+@maybe_njit(cache=False)
+def _rounded_path_index(start_index, end_index, sample_index, sample_count):
+    if sample_count <= 1:
+        return int(start_index)
+    if sample_index <= 0:
+        return int(start_index)
+    if sample_index >= sample_count - 1:
+        return int(end_index)
+    step = (end_index - start_index) / (sample_count - 1.0)
+    return int(np.rint(start_index + step * sample_index))
+
+
+@maybe_njit(cache=False)
+def _lookup_value(lookup, raw_value):
+    index = int(raw_value)
+    if index < 0:
+        index = 0
+    elif index >= lookup.shape[0]:
+        index = lookup.shape[0] - 1
+    return lookup[index]
+
+
+@maybe_njit(cache=False)
+def _path_loss_only_by_index(
+    terrain_values,
+    worldcover_values,
+    terrain_x,
+    terrain_y,
+    row1,
+    col1,
+    row2,
+    col2,
+    observer_height,
+    target_height,
+    min_samples,
+    sample_spacing_m,
+    legacy_sample_spacing_m,
+    offset_lookup,
+    attenuation_lookup,
+):
+    reverse_requested = (row2 < row1) or (row2 == row1 and col2 < col1)
+    if reverse_requested:
+        original_row1 = row1
+        original_col1 = col1
+        original_observer_height = observer_height
+        row1 = row2
+        col1 = col2
+        row2 = original_row1
+        col2 = original_col1
+        observer_height = target_height
+        target_height = original_observer_height
+
+    x1 = float(terrain_x[col1])
+    y1 = float(terrain_y[row1])
+    z1 = float(terrain_values[row1, col1] + observer_height)
+    x2 = float(terrain_x[col2])
+    y2 = float(terrain_y[row2])
+    z2 = float(terrain_values[row2, col2] + target_height)
+
+    dx = x2 - x1
+    dy = y2 - y1
+    dist = math.sqrt(dx * dx + dy * dy)
+    spacing_m = max(float(sample_spacing_m), 1e-6)
+    sample_count = max(int(min_samples), int(math.ceil(dist / spacing_m)))
+    if sample_count < 1:
+        sample_count = 1
+    legacy_spacing_m = max(float(legacy_sample_spacing_m), 1e-6)
+    legacy_sample_count = max(int(min_samples), int(math.ceil(dist / legacy_spacing_m)))
+    current_active_samples = max(sample_count - 2, 1)
+    legacy_active_samples = max(legacy_sample_count - 2, 1)
+    sample_weight = float(legacy_active_samples) / float(current_active_samples)
+
+    total_distance_m = 0.0
+    prev_x = x1
+    prev_y = y1
+    for sample_index in range(1, sample_count):
+        row = _rounded_path_index(row1, row2, sample_index, sample_count)
+        col = _rounded_path_index(col1, col2, sample_index, sample_count)
+        x = float(terrain_x[col])
+        y = float(terrain_y[row])
+        step_dx = x - prev_x
+        step_dy = y - prev_y
+        total_distance_m += math.sqrt(step_dx * step_dx + step_dy * step_dy)
+        prev_x = x
+        prev_y = y
+
+    total_distance_m = max(total_distance_m, 1e-6)
+    distance_along_m = 0.0
+    prev_x = x1
+    prev_y = y1
+    path_loss_db = 0.0
+
+    for sample_index in range(sample_count):
+        row = _rounded_path_index(row1, row2, sample_index, sample_count)
+        col = _rounded_path_index(col1, col2, sample_index, sample_count)
+        x = float(terrain_x[col])
+        y = float(terrain_y[row])
+        if sample_index > 0:
+            step_dx = x - prev_x
+            step_dy = y - prev_y
+            distance_along_m += math.sqrt(step_dx * step_dx + step_dy * step_dy)
+        prev_x = x
+        prev_y = y
+
+        path_fraction = distance_along_m / total_distance_m
+        line_z = z1 + (z2 - z1) * path_fraction
+
+        dx1 = x - x1
+        dy1 = y - y1
+        dz1 = line_z - z1
+        dx2 = x - x2
+        dy2 = y - y2
+        dz2 = line_z - z2
+        d1 = math.sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1)
+        d2 = math.sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2)
+        fresnel = math.sqrt((0.3304 * d1 * d2) / max(d1 + d2, 1e-6))
+
+        terrain_height = float(terrain_values[row, col])
+        worldcover_class = worldcover_values[row, col]
+        obstruction_top = terrain_height + _lookup_value(offset_lookup, worldcover_class)
+        clearance_height = line_z - fresnel * 0.6
+        fresnel_zone_height = max(line_z - clearance_height, 1e-6)
+        blockage_fraction = (obstruction_top - clearance_height) / fresnel_zone_height
+        if blockage_fraction < 0.0:
+            blockage_fraction = 0.0
+        elif blockage_fraction > 1.0:
+            blockage_fraction = 1.0
+        terrain_only_blocked = terrain_height >= line_z
+
+        if sample_index == 0 or sample_index == sample_count - 1:
+            blockage_fraction = 0.0
+            terrain_only_blocked = False
+
+        path_loss_db += _lookup_value(attenuation_lookup, worldcover_class) * blockage_fraction * sample_weight
+        if terrain_only_blocked:
+            path_loss_db += 20.0 * sample_weight
+
+    return path_loss_db
+
+
+@maybe_njit(parallel=True, cache=False)
+def _compute_ground_loss_batch_numba(
+    terrain_values,
+    worldcover_values,
+    terrain_x,
+    terrain_y,
+    observer_row,
+    observer_col,
+    target_rows,
+    target_cols,
+    observer_height,
+    target_height,
+    min_samples,
+    sample_spacing_m,
+    legacy_sample_spacing_m,
+    offset_lookup,
+    attenuation_lookup,
+):
+    losses = np.empty(target_rows.shape[0], dtype=np.float32)
+    for index in prange(target_rows.shape[0]):
+        losses[index] = _path_loss_only_by_index(
+            terrain_values,
+            worldcover_values,
+            terrain_x,
+            terrain_y,
+            int(observer_row),
+            int(observer_col),
+            int(target_rows[index]),
+            int(target_cols[index]),
+            observer_height,
+            target_height,
+            min_samples,
+            sample_spacing_m,
+            legacy_sample_spacing_m,
+            offset_lookup,
+            attenuation_lookup,
+        )
+    return losses
+
+
+def normalize_target_indices(target_rows_or_cells, target_cols=None):
+    if target_cols is not None:
+        rows = np.asarray(target_rows_or_cells, dtype=np.int32).reshape(-1)
+        cols = np.asarray(target_cols, dtype=np.int32).reshape(-1)
+        return rows, cols
+
+    if target_rows_or_cells is None:
+        empty = np.empty(0, dtype=np.int32)
+        return empty, empty
+
+    cells = np.asarray(target_rows_or_cells)
+    if cells.size == 0:
+        empty = np.empty(0, dtype=np.int32)
+        return empty, empty
+    if cells.ndim != 2 or cells.shape[1] != 2:
+        raise ValueError("Target cells must be an array-like collection of (row, col) pairs.")
+    return cells[:, 0].astype(np.int32, copy=False), cells[:, 1].astype(np.int32, copy=False)
+
+
 @lru_cache(maxsize=200000)
 def _get_path_profile_by_index_cached(row1, col1, row2, col2, observer_height=0.0, target_height=0.0, min_samples=2):
     terrain_x = ANALYSIS_CONTEXT["terrain_x"]
@@ -1918,21 +2175,20 @@ def _get_path_profile_by_index_cached(row1, col1, row2, col2, observer_height=0.
         path_fraction = np.array([0.0], dtype=np.float64)
 
     line_z = pos1[2] + (pos2[2] - pos1[2]) * path_fraction
-    line = np.column_stack((x_path, y_path, line_z))
-
-    d1 = np.array([dist3d(pos1, point) for point in line], dtype=np.float64)
-    d2 = np.array([dist3d(pos2, point) for point in line], dtype=np.float64)
+    d1 = np.sqrt((x_path - pos1[0]) ** 2 + (y_path - pos1[1]) ** 2 + (line_z - pos1[2]) ** 2)
+    d2 = np.sqrt((x_path - pos2[0]) ** 2 + (y_path - pos2[1]) ** 2 + (line_z - pos2[2]) ** 2)
     fresnel = np.sqrt((0.3304 * d1 * d2) / np.maximum(d1 + d2, 1e-6))
 
     ground_surface = worldcover_values[row_path, col_path]
     ground_surface_offset = V_OFFSET(ground_surface)
-    terrain_only_blocked = terrain_values[row_path, col_path] >= line[:, 2]
+    terrain_profile = terrain_values[row_path, col_path]
+    terrain_only_blocked = terrain_profile >= line_z
     terrain_only_blocked[0] = False
     terrain_only_blocked[-1] = False
 
-    obstruction_top = terrain_values[row_path, col_path] + ground_surface_offset
-    clearance_height = line[:, 2] - fresnel * 0.6
-    fresnel_zone_height = np.maximum(line[:, 2] - clearance_height, 1e-6)
+    obstruction_top = terrain_profile + ground_surface_offset
+    clearance_height = line_z - fresnel * 0.6
+    fresnel_zone_height = np.maximum(line_z - clearance_height, 1e-6)
     blockage_fraction = np.clip((obstruction_top - clearance_height) / fresnel_zone_height, 0.0, 1.0)
     blockage_fraction[0] = 0.0
     blockage_fraction[-1] = 0.0
@@ -2010,27 +2266,42 @@ def get_path_losses_by_index(row1, col1, row2, col2, observer_height=0.0, target
 
 
 def compute_ground_loss_for_chunk(args):
-    observer_row, observer_col, cells, observer_height, target_height = args
-    rows = []
-    cols = []
-    losses = []
-    for row, col in cells:
-        path_loss_db = get_path_losses_by_index(
-            observer_row,
-            observer_col,
-            int(row),
-            int(col),
-            observer_height=observer_height,
-            target_height=target_height,
-        )
-        rows.append(int(row))
-        cols.append(int(col))
-        losses.append(path_loss_db)
-    return (
-        np.asarray(rows, dtype=np.int32),
-        np.asarray(cols, dtype=np.int32),
-        np.asarray(losses, dtype=np.float32),
+    if len(args) == 5:
+        observer_row, observer_col, cells, observer_height, target_height = args
+        rows, cols = normalize_target_indices(cells)
+        sample_spacing_m = DEFAULT_RSSI_PATH_SAMPLE_SPACING_M
+    elif len(args) == 6:
+        observer_row, observer_col, rows, cols, observer_height, target_height = args
+        sample_spacing_m = DEFAULT_RSSI_PATH_SAMPLE_SPACING_M
+        rows, cols = normalize_target_indices(rows, cols)
+    elif len(args) == 7:
+        observer_row, observer_col, rows, cols, observer_height, target_height, sample_spacing_m = args
+        rows, cols = normalize_target_indices(rows, cols)
+    else:
+        raise ValueError("Expected 5, 6, or 7 arguments for compute_ground_loss_for_chunk.")
+
+    if rows.size == 0:
+        return rows, cols, np.empty(0, dtype=np.float32)
+    sample_spacing_m = normalize_rssi_path_sample_spacing(sample_spacing_m)
+
+    losses = _compute_ground_loss_batch_numba(
+        ANALYSIS_CONTEXT["terrain_values"],
+        ANALYSIS_CONTEXT["worldcover_values"],
+        ANALYSIS_CONTEXT["terrain_x"],
+        ANALYSIS_CONTEXT["terrain_y"],
+        int(observer_row),
+        int(observer_col),
+        rows,
+        cols,
+        float(observer_height),
+        float(target_height),
+        2,
+        float(sample_spacing_m),
+        float(DEFAULT_RSSI_PATH_SAMPLE_SPACING_M),
+        OFFSET_LOOKUP,
+        ATTENUATION_LOOKUP,
     )
+    return rows, cols, np.asarray(losses, dtype=np.float32)
 
 
 def fspl_db(distance_km, freq_mhz):
@@ -2133,12 +2404,11 @@ def compute_path_loss(
         path_fraction = np.array([0.0], dtype=np.float64)
 
     los_line = tx_z + (rx_z - tx_z) * path_fraction
-    line_points = np.column_stack((x_path, y_path, los_line))
     p1 = (x1, y1, tx_z)
     p2 = (x2, y2, rx_z)
 
-    d1 = np.array([dist3d(p1, point) for point in line_points], dtype=np.float64)
-    d2 = np.array([dist3d(p2, point) for point in line_points], dtype=np.float64)
+    d1 = np.sqrt((x_path - x1) ** 2 + (y_path - y1) ** 2 + (los_line - tx_z) ** 2)
+    d2 = np.sqrt((x_path - x2) ** 2 + (y_path - y2) ** 2 + (los_line - rx_z) ** 2)
     fresnel_radius = np.sqrt((0.3304 * d1 * d2) / np.maximum(d1 + d2, 1e-6))
     fresnel_60 = 0.6 * fresnel_radius
     fresnel_upper = los_line + fresnel_60
@@ -2638,7 +2908,13 @@ def compute_link_results(nodes, bundle):
     return link_results
 
 
-def compute_node_rssi_summaries(nodes, bundle, global_rx_height_agl_m, global_rx_gain_dbi):
+def compute_node_rssi_summaries(
+    nodes,
+    bundle,
+    global_rx_height_agl_m,
+    global_rx_gain_dbi,
+    sample_spacing_m=DEFAULT_RSSI_PATH_SAMPLE_SPACING_M,
+):
     if not nodes:
         return {}
 
@@ -2646,6 +2922,7 @@ def compute_node_rssi_summaries(nodes, bundle, global_rx_height_agl_m, global_rx
     observer_frame = build_observer_frame(nodes)
     terrain_da = ANALYSIS_CONTEXT["terrain_da"]
     x_grid, y_grid = np.meshgrid(terrain_da.x.values, terrain_da.y.values)
+    sample_spacing_m = normalize_rssi_path_sample_spacing(sample_spacing_m)
 
     x_step = float(abs(terrain_da.x.values[1] - terrain_da.x.values[0])) if terrain_da.x.size > 1 else 0.0
     y_step = float(abs(terrain_da.y.values[1] - terrain_da.y.values[0])) if terrain_da.y.size > 1 else 0.0
@@ -2667,11 +2944,18 @@ def compute_node_rssi_summaries(nodes, bundle, global_rx_height_agl_m, global_rx
         distance_km = np.maximum(distance_km, 1e-6)
         ground_loss_db = np.zeros(terrain_da.shape, dtype=np.float32)
 
-        visible_indices = np.argwhere(visible_mask)
-        cells = [(int(row), int(col)) for row, col in visible_indices]
-        if cells:
+        visible_rows, visible_cols = np.nonzero(visible_mask)
+        if visible_rows.size:
             chunk_rows, chunk_cols, chunk_losses = compute_ground_loss_for_chunk(
-                (observer_row, observer_col, cells, float(observer.observer_elev), float(global_rx_height_agl_m))
+                (
+                    observer_row,
+                    observer_col,
+                    visible_rows,
+                    visible_cols,
+                    float(observer.observer_elev),
+                    float(global_rx_height_agl_m),
+                    float(sample_spacing_m),
+                )
             )
             ground_loss_db[chunk_rows, chunk_cols] = chunk_losses
 
@@ -2700,7 +2984,14 @@ def compute_node_rssi_summaries(nodes, bundle, global_rx_height_agl_m, global_rx
     return summaries
 
 
-def compute_rssi_overlay(nodes, bundle, include_ground_loss, global_rx_height_agl_m, global_rx_gain_dbi):
+def compute_rssi_overlay(
+    nodes,
+    bundle,
+    include_ground_loss,
+    global_rx_height_agl_m,
+    global_rx_gain_dbi,
+    sample_spacing_m=DEFAULT_RSSI_PATH_SAMPLE_SPACING_M,
+):
     if not nodes:
         return None
 
@@ -2711,6 +3002,7 @@ def compute_rssi_overlay(nodes, bundle, include_ground_loss, global_rx_height_ag
         include_ground_loss,
         global_rx_height_agl_m,
         global_rx_gain_dbi,
+        sample_spacing_m=sample_spacing_m,
     )
     if cache_key in RSSI_OVERLAY_CACHE:
         return RSSI_OVERLAY_CACHE[cache_key]
@@ -2720,6 +3012,7 @@ def compute_rssi_overlay(nodes, bundle, include_ground_loss, global_rx_height_ag
     terrain_da = ANALYSIS_CONTEXT["terrain_da"]
     x_grid, y_grid = np.meshgrid(terrain_da.x.values, terrain_da.y.values)
     max_rssi = np.full(terrain_da.shape, np.nan, dtype=np.float32)
+    sample_spacing_m = normalize_rssi_path_sample_spacing(sample_spacing_m)
 
     for observer in observer_frame.itertuples(index=False):
         vs = viewshed(
@@ -2736,11 +3029,18 @@ def compute_rssi_overlay(nodes, bundle, include_ground_loss, global_rx_height_ag
 
         if include_ground_loss:
             observer_row, observer_col, _obs_x, _obs_y, _obs_z = snap_point(observer.x, observer.y)
-            visible_indices = np.argwhere(visible_mask)
-            cells = [(int(row), int(col)) for row, col in visible_indices]
-            if cells:
+            visible_rows, visible_cols = np.nonzero(visible_mask)
+            if visible_rows.size:
                 chunk_rows, chunk_cols, chunk_losses = compute_ground_loss_for_chunk(
-                    (observer_row, observer_col, cells, float(observer.observer_elev), float(global_rx_height_agl_m))
+                    (
+                        observer_row,
+                        observer_col,
+                        visible_rows,
+                        visible_cols,
+                        float(observer.observer_elev),
+                        float(global_rx_height_agl_m),
+                        float(sample_spacing_m),
+                    )
                 )
                 ground_loss_db[chunk_rows, chunk_cols] = chunk_losses
 
@@ -2780,7 +3080,14 @@ def compute_rssi_overlay(nodes, bundle, include_ground_loss, global_rx_height_ag
     return result
 
 
-def compute_single_node_rssi_overlay(node, bundle, include_ground_loss, global_rx_height_agl_m, global_rx_gain_dbi):
+def compute_single_node_rssi_overlay(
+    node,
+    bundle,
+    include_ground_loss,
+    global_rx_height_agl_m,
+    global_rx_gain_dbi,
+    sample_spacing_m=DEFAULT_RSSI_PATH_SAMPLE_SPACING_M,
+):
     normalized = with_node_defaults(node)
     cache_key = overlay_cache_key(
         bundle,
@@ -2788,6 +3095,7 @@ def compute_single_node_rssi_overlay(node, bundle, include_ground_loss, global_r
         include_ground_loss,
         global_rx_height_agl_m,
         global_rx_gain_dbi,
+        sample_spacing_m=sample_spacing_m,
     )
     if cache_key in RSSI_OVERLAY_CACHE:
         return cache_key, RSSI_OVERLAY_CACHE[cache_key]
@@ -2797,6 +3105,7 @@ def compute_single_node_rssi_overlay(node, bundle, include_ground_loss, global_r
     terrain_da = ANALYSIS_CONTEXT["terrain_da"]
     x_grid, y_grid = np.meshgrid(terrain_da.x.values, terrain_da.y.values)
     observer = next(observer_frame.itertuples(index=False))
+    sample_spacing_m = normalize_rssi_path_sample_spacing(sample_spacing_m)
 
     vs = viewshed(
         terrain_da,
@@ -2812,11 +3121,18 @@ def compute_single_node_rssi_overlay(node, bundle, include_ground_loss, global_r
 
     if include_ground_loss:
         observer_row, observer_col, _obs_x, _obs_y, _obs_z = snap_point(observer.x, observer.y)
-        visible_indices = np.argwhere(visible_mask)
-        cells = [(int(row), int(col)) for row, col in visible_indices]
-        if cells:
+        visible_rows, visible_cols = np.nonzero(visible_mask)
+        if visible_rows.size:
             chunk_rows, chunk_cols, chunk_losses = compute_ground_loss_for_chunk(
-                (observer_row, observer_col, cells, float(observer.observer_elev), float(global_rx_height_agl_m))
+                (
+                    observer_row,
+                    observer_col,
+                    visible_rows,
+                    visible_cols,
+                    float(observer.observer_elev),
+                    float(global_rx_height_agl_m),
+                    float(sample_spacing_m),
+                )
             )
             ground_loss_db[chunk_rows, chunk_cols] = chunk_losses
 
@@ -2931,6 +3247,9 @@ def get_enabled_rssi_overlay_entries(bundle, nodes, calculation_store, overlay_s
     include_ground_loss = bool(calculation_store.get("include_ground_loss", False))
     rx_height = float(calculation_store.get("global_rx_height_agl", DEFAULT_GLOBAL_RX_HEIGHT_M))
     rx_gain = float(calculation_store.get("global_rx_gain_dbi", DEFAULT_RX_GAIN_DBI))
+    sample_spacing_m = normalize_rssi_path_sample_spacing(
+        calculation_store.get("path_sample_spacing_m", DEFAULT_RSSI_PATH_SAMPLE_SPACING_M)
+    )
 
     for node_id in enabled_node_ids:
         expected_key = node_keys.get(node_id)
@@ -2947,6 +3266,7 @@ def get_enabled_rssi_overlay_entries(bundle, nodes, calculation_store, overlay_s
             include_ground_loss,
             rx_height,
             rx_gain,
+            sample_spacing_m=sample_spacing_m,
         )
         if expected_key and cache_key != expected_key:
             continue
@@ -3038,14 +3358,24 @@ def resolve_rssi_provider_overlay(bundle, nodes, calculation_store, overlay_sele
     return build_best_node_rssi_overlay(entries)
 
 
-def overlay_cache_key(bundle, nodes, include_ground_loss, global_rx_height_agl_m, global_rx_gain_dbi):
+def overlay_cache_key(
+    bundle,
+    nodes,
+    include_ground_loss,
+    global_rx_height_agl_m,
+    global_rx_gain_dbi,
+    sample_spacing_m=DEFAULT_RSSI_PATH_SAMPLE_SPACING_M,
+):
     normalized_nodes = [with_node_defaults(node) for node in nodes]
+    normalized_spacing = normalize_rssi_path_sample_spacing(sample_spacing_m)
     parts = [
         f"{bundle['cache_key']}",
         str(bool(include_ground_loss)),
         f"{float(global_rx_height_agl_m):.3f}",
         f"{float(global_rx_gain_dbi):.3f}",
     ]
+    if include_ground_loss:
+        parts.append(f"spacing:{normalized_spacing:.1f}")
     for node in normalized_nodes:
         parts.append(
             "|".join(
@@ -3712,10 +4042,31 @@ app.layout = [
                                     dcc.Checklist(
                                         id="include-rssi-ground-loss",
                                         options=[{"label": " Include per-cell path attenuation in RSSI overlay", "value": "enabled"}],
-                                        value=[],
+                                        value=["enabled"],
                                     ),
                                     html.Div(
-                                        "⚠️Very Computationally Intensive (1H+ for 10 Nodes)",
+                                        "RSSI path sample spacing (m)",
+                                        style={"fontWeight": "600", "marginTop": "4px"},
+                                    ),
+                                    dcc.Slider(
+                                        RSSI_PATH_SAMPLE_SPACING_MIN_M,
+                                        RSSI_PATH_SAMPLE_SPACING_MAX_M,
+                                        step=RSSI_PATH_SAMPLE_SPACING_STEP_M,
+                                        value=DEFAULT_RSSI_PATH_SAMPLE_SPACING_M,
+                                        marks={
+                                            int(value): str(int(value))
+                                            for value in np.arange(
+                                                RSSI_PATH_SAMPLE_SPACING_MIN_M,
+                                                RSSI_PATH_SAMPLE_SPACING_MAX_M + RSSI_PATH_SAMPLE_SPACING_STEP_M,
+                                                RSSI_PATH_SAMPLE_SPACING_STEP_M,
+                                            )
+                                        },
+                                        id="rssi-path-sample-spacing-m",
+                                        updatemode="mouseup",
+                                        disabled=True,
+                                    ),
+                                    html.Div(
+                                        "Lower spacing increases path-trace density and runtime. 100 m matches the previous default.",
                                         style={"fontSize": "12px", "color": "#cbd5e1"},
                                     ),
                                 ],
@@ -4055,6 +4406,15 @@ def update_locked_control_state(terrain_ready):
         disabled,
         disabled,
     )
+
+
+@app.callback(
+    Output("rssi-path-sample-spacing-m", "disabled"),
+    Input("terrain-ready-store", "data"),
+    Input("include-rssi-ground-loss", "value"),
+)
+def update_rssi_path_sample_spacing_disabled(terrain_ready, include_rssi_ground_loss):
+    return (not bool(terrain_ready)) or ("enabled" not in (include_rssi_ground_loss or []))
 
 
 @app.callback(
@@ -4793,6 +5153,10 @@ def update_native_map_spec(
     global_rx_gain_dbi,
 ):
     nodes = list(nodes or [])
+    bundle = None
+    rssi_overlay = None
+    viewshed_overlay = None
+    bbox_outline = bbox_preview_data or bbox_data
     overlay_context_key = native_map_overlay_context_key(
         nodes,
         selected_node_ids,
@@ -4822,11 +5186,6 @@ def update_native_map_spec(
         },
     )
     try:
-        bundle = None
-        rssi_overlay = None
-        viewshed_overlay = None
-        bbox_outline = bbox_preview_data or bbox_data
-
         if bbox_data:
             terrain_bbox = normalize_bbox(
                 bbox_data["min_lon"],
@@ -4904,6 +5263,43 @@ def update_native_map_spec(
             )
         except Exception:
             fallback_path_overlay = empty_native_path_overlay()
+
+        if bundle is not None:
+            try:
+                fallback_spec = build_native_map_spec(
+                    bundle,
+                    nodes,
+                    0.0 if terrain_alpha is None else float(terrain_alpha),
+                    terrain_clip_range=terrain_clip_range,
+                    elevation_colorscale=elevation_colormap or "Magma",
+                    worldcover_enabled="enabled" in (worldcover_display or []),
+                    worldcover_opacity=0.0 if worldcover_opacity is None else float(worldcover_opacity),
+                    viewshed_point_data=viewshed_point_data,
+                    viewshed_radius_m=viewshed_radius,
+                    viewshed_sample_count=viewshed_sample_count,
+                    viewshed_overlay=None,
+                    viewshed_colorscale=viewshed_colormap or "Turbo",
+                    viewshed_opacity=0.0 if viewshed_opacity is None else float(viewshed_opacity),
+                    rssi_overlay=None,
+                    rssi_colorscale=rssi_colormap or "Turbo",
+                    loaded_bbox=bbox_outline,
+                    selected_node_ids=selected_node_ids,
+                    base_map_style=base_map_style or "satellite",
+                    rssi_opacity=0.55 if rssi_opacity is None else float(rssi_opacity),
+                    path_overlay=fallback_path_overlay,
+                    overlay_context_key=overlay_context_key,
+                    visual_context_key=visual_context_key,
+                )
+                fallback_spec["error"] = f"Failed to refresh native map overlays: {exc}"
+                legends = build_native_map_legends(
+                    fallback_spec.get("terrain_legend"),
+                    fallback_spec.get("worldcover_legend"),
+                    fallback_spec.get("rssi_legend"),
+                    fallback_spec.get("viewshed_legend"),
+                )
+                return fallback_spec, legends
+            except Exception:
+                pass
 
         fallback_spec = {
             "base_style_key": str(base_map_style or "satellite"),
@@ -5221,6 +5617,7 @@ def update_node_summary(nodes, selected_node_ids, _calculation_store, overlay_se
     State("global-rx-height-agl", "value"),
     State("global-rx-gain-dbi", "value"),
     State("include-rssi-ground-loss", "value"),
+    State("rssi-path-sample-spacing-m", "value"),
     prevent_initial_call=True,
 )
 def generate_rssi_overlay(
@@ -5231,6 +5628,7 @@ def generate_rssi_overlay(
     global_rx_height_agl,
     global_rx_gain_dbi,
     include_rssi_ground_loss,
+    rssi_path_sample_spacing_m,
 ):
     if not run_request:
         raise PreventUpdate
@@ -5269,14 +5667,34 @@ def generate_rssi_overlay(
     include_ground_loss = "enabled" in (include_rssi_ground_loss or [])
     rx_height = global_rx_height_agl or DEFAULT_GLOBAL_RX_HEIGHT_M
     rx_gain = global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI
+    sample_spacing_m = normalize_rssi_path_sample_spacing(rssi_path_sample_spacing_m)
     node_overlay_keys = {}
     node_signatures = {}
     try:
-        for node in nodes:
-            cache_key, _result = compute_single_node_rssi_overlay(node, bundle, include_ground_loss, rx_height, rx_gain)
-            node_id = str(node["id"])
-            node_overlay_keys[node_id] = cache_key
-            node_signatures[node_id] = node_signature(node)
+        progress = tqdm(
+            nodes,
+            total=len(nodes),
+            desc="RSSI overlay",
+            unit="node",
+            dynamic_ncols=True,
+            leave=True,
+        )
+        try:
+            for node in progress:
+                cache_key, _result = compute_single_node_rssi_overlay(
+                    node,
+                    bundle,
+                    include_ground_loss,
+                    rx_height,
+                    rx_gain,
+                    sample_spacing_m=sample_spacing_m,
+                )
+                node_id = str(node["id"])
+                node_overlay_keys[node_id] = cache_key
+                node_signatures[node_id] = node_signature(node)
+        finally:
+            if hasattr(progress, "close"):
+                progress.close()
     except Exception as exc:
         return (
             no_update,
@@ -5294,6 +5712,7 @@ def generate_rssi_overlay(
         "include_ground_loss": include_ground_loss,
         "global_rx_height_agl": float(rx_height),
         "global_rx_gain_dbi": float(rx_gain),
+        "path_sample_spacing_m": float(sample_spacing_m),
         "node_overlay_keys": node_overlay_keys,
         "node_signatures": node_signatures,
         "node_order": [str(node["id"]) for node in nodes],
@@ -5308,7 +5727,8 @@ def generate_rssi_overlay(
         "RSSI Overlay Complete",
         (
             f"Computed RSSI overlay for {len(nodes)} nodes {mode} at "
-            f"{float(rx_height):.1f} m AGL / {float(rx_gain):.1f} dBi."
+            f"{float(rx_height):.1f} m AGL / {float(rx_gain):.1f} dBi"
+            f"{f' with {sample_spacing_m:.0f} m path samples.' if include_ground_loss else '.'}"
         ),
     )
     return (
