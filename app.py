@@ -1,11 +1,14 @@
 import asyncio
 import base64
+import gc
 import hashlib
 import io
 import json
 import logging
 import math
+import os
 import threading
+import time
 import warnings
 from contextlib import contextmanager
 from functools import lru_cache
@@ -17,6 +20,7 @@ import plotly.graph_objs as go
 import rasterio
 import requests
 import xarray as xr
+import dask
 from PIL import Image, ImageColor
 from dash import ALL, ClientsideFunction, Dash, Input, Output, State, ctx, dcc, html, no_update
 from dash.exceptions import PreventUpdate
@@ -65,11 +69,11 @@ DEFAULT_BBOX = {
 
 DISPLAY_MAX_DIM = 2400
 DISPLAY_MIN_DIM = 512
-DEFAULT_NODE_HEIGHT_M = 8.0
+DEFAULT_NODE_HEIGHT_M = 2.0
 DEFAULT_GLOBAL_RX_HEIGHT_M = 2.0
 DEFAULT_FREQ_MHZ = 915.0
-DEFAULT_TX_POWER_DBM = 30.0
-DEFAULT_TX_GAIN_DBI = 6.0
+DEFAULT_TX_POWER_DBM = 22.0
+DEFAULT_TX_GAIN_DBI = 5.0
 DEFAULT_RX_GAIN_DBI = 2.0
 DEFAULT_OTHER_LOSSES_DB = 3.0
 RSSI_PATH_SAMPLE_SPACING_MIN_M = 25.0
@@ -83,7 +87,7 @@ VIEWSHED_ASSESSMENT_MAX_SAMPLES = 160
 VIEWSHED_ASSESSMENT_TARGET_RESOLUTION_M = 1.0
 VIEWSHED_ASSESSMENT_MIN_DIM = 64
 VIEWSHED_ASSESSMENT_MAX_DIM = 128
-VIEWSHED_ASSESSMENT_METRIC_VERSION = "global-visible-cell-count-v4-circular-rbf"
+VIEWSHED_ASSESSMENT_METRIC_VERSION = "global-visible-cell-count-v5-circular-thin-plate-spline"
 VIEWSHED_SAMPLE_COUNT_OPTIONS = [7, 19, 37, 61, 91, 127]
 DEFAULT_VIEWSHED_SAMPLE_COUNT = 37
 VIEWSHED_COLOR_SCALE_OPTIONS = ["Turbo", "Viridis", "Magma", "Inferno", "Cividis", "Plasma"]
@@ -91,7 +95,12 @@ VIEWSHED_POINT_COLOR = "#ef4444"
 VIEWSHED_POINT_OUTLINE_COLOR = "#ffffff"
 VIEWSHED_LEGEND_TITLE = "Visible Cells"
 
-COLOR_SEQUENCE = qualitative.Dark24 + qualitative.Bold + qualitative.Safe + qualitative.Set3
+NODE_EXCLUDED_COLORS = {"#000000", "#000", "black", "#222a2a"}
+COLOR_SEQUENCE = [
+    color
+    for color in (qualitative.Dark24 + qualitative.Bold + qualitative.Safe + qualitative.Set3)
+    if str(color).strip().lower() not in NODE_EXCLUDED_COLORS
+]
 ELEVATION_COLOR_SCALE_OPTIONS = ["Magma", "Viridis", "Cividis", "Inferno", "Plasma", "Greys"]
 RSSI_COLOR_SCALE_OPTIONS = ["Turbo", "Viridis", "Cividis", "Inferno", "Plasma", "RdYlGn"]
 BASE_MAP_STYLE_OPTIONS = [
@@ -177,6 +186,13 @@ ATTENUATION = {
     95: 2,
     100: 0,
 }
+
+EARTH_RADIUS_M = 6_371_000.0
+STANDARD_REFRACTION_K_FACTOR = 4.0 / 3.0
+EFFECTIVE_EARTH_RADIUS_M = EARTH_RADIUS_M * STANDARD_REFRACTION_K_FACTOR
+PATH_PROFILE_CACHE_MAXSIZE = 8192
+RSSI_DASK_MAX_WORKERS = 8
+VIEWSHED_DASK_MAX_WORKERS = 8
 
 
 def maybe_njit(*args, **kwargs):
@@ -401,6 +417,93 @@ def safe_reproject(**kwargs):
         reproject(**kwargs)
 
 
+def materialize_data_array_values(data_array, dtype=None):
+    data = data_array.data
+    if dask.is_dask_collection(data):
+        data = data.compute()
+    array = np.asarray(data)
+    if dtype is not None:
+        array = array.astype(dtype, copy=False)
+    return array
+
+
+def cached_bundle_data_array_values(bundle, key, dtype=None):
+    cache_key = f"{key}_values_cache"
+    cached = bundle.get(cache_key)
+    if cached is not None:
+        if dtype is None or cached.dtype == np.dtype(dtype):
+            return cached
+    values = materialize_data_array_values(bundle[key], dtype=dtype)
+    bundle[cache_key] = values
+    return values
+
+
+def cached_bundle_eager_data_array(bundle, key, dtype=None):
+    cache_key = f"{key}_eager_cache"
+    cached = bundle.get(cache_key)
+    if cached is not None:
+        if dtype is None or cached.dtype == np.dtype(dtype):
+            return cached
+    source = bundle[key]
+    if not dask.is_dask_collection(source.data) and (dtype is None or source.dtype == np.dtype(dtype)):
+        bundle[cache_key] = source
+        return source
+    values = cached_bundle_data_array_values(bundle, key, dtype=dtype)
+    eager = source.copy(data=values)
+    bundle[cache_key] = eager
+    return eager
+
+
+def raster_window_from_bounds(min_x, min_y, max_x, max_y, transform_affine, width, height, padding=1):
+    raw_window = rasterio.windows.from_bounds(
+        float(min_x),
+        float(min_y),
+        float(max_x),
+        float(max_y),
+        transform=transform_affine,
+    )
+    col_start = max(int(math.floor(raw_window.col_off)) - int(padding), 0)
+    row_start = max(int(math.floor(raw_window.row_off)) - int(padding), 0)
+    col_stop = min(int(math.ceil(raw_window.col_off + raw_window.width)) + int(padding), int(width))
+    row_stop = min(int(math.ceil(raw_window.row_off + raw_window.height)) + int(padding), int(height))
+    if col_stop <= col_start or row_stop <= row_start:
+        return None
+    return rasterio.windows.Window(
+        col_off=col_start,
+        row_off=row_start,
+        width=col_stop - col_start,
+        height=row_stop - row_start,
+    )
+
+
+def subset_raster_for_bounds(values, transform_affine, min_x, min_y, max_x, max_y, padding=1):
+    array = np.asarray(values)
+    if array.ndim != 2:
+        return array, transform_affine
+
+    window = raster_window_from_bounds(
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        transform_affine,
+        array.shape[1],
+        array.shape[0],
+        padding=padding,
+    )
+    if window is None:
+        return array, transform_affine
+
+    row_start = int(window.row_off)
+    row_stop = row_start + int(window.height)
+    col_start = int(window.col_off)
+    col_stop = col_start + int(window.width)
+    subset = array[row_start:row_stop, col_start:col_stop]
+    if subset.size == 0:
+        return array, transform_affine
+    return subset, rasterio.windows.transform(window, transform_affine)
+
+
 def worldcover_tile_code(lat_start, lon_start):
     lat_prefix = "N" if lat_start >= 0 else "S"
     lon_prefix = "E" if lon_start >= 0 else "W"
@@ -449,6 +552,30 @@ def raster_axes(transform_affine, rows, cols):
         )[1]
     )
     return x_axis, y_axis
+
+
+def nearest_axis_index(axis, value):
+    axis = np.asarray(axis, dtype=np.float64)
+    if axis.size == 0:
+        raise ValueError("Axis must contain at least one value.")
+    if axis.size == 1:
+        return 0
+
+    target = float(value)
+    ascending = bool(axis[0] <= axis[-1])
+    search_axis = axis if ascending else -axis
+    search_value = target if ascending else -target
+    insert_index = int(np.searchsorted(search_axis, search_value, side="left"))
+    if insert_index <= 0:
+        return 0
+    if insert_index >= axis.size:
+        return int(axis.size - 1)
+
+    left_index = insert_index - 1
+    right_index = insert_index
+    left_distance = abs(target - float(axis[left_index]))
+    right_distance = abs(float(axis[right_index]) - target)
+    return int(left_index if left_distance <= right_distance else right_index)
 
 
 def normalize_bbox(min_lon, min_lat, max_lon, max_lat):
@@ -588,6 +715,101 @@ def geographic_bbox_to_pixel_shape(min_lon, min_lat, max_lon, max_lat, max_dim=D
     return extent_to_pixel_shape(min_lon, min_lat, max_lon, max_lat, max_dim=max_dim, min_dim=min_dim)
 
 
+@lru_cache(maxsize=1)
+def default_geographic_pixel_size():
+    min_lon, min_lat, max_lon, max_lat = normalize_bbox(
+        DEFAULT_BBOX["min_lon"],
+        DEFAULT_BBOX["min_lat"],
+        DEFAULT_BBOX["max_lon"],
+        DEFAULT_BBOX["max_lat"],
+    )
+    width, height = geographic_bbox_to_pixel_shape(min_lon, min_lat, max_lon, max_lat)
+    return (
+        max((max_lon - min_lon) / max(width, 1), 1e-9),
+        max((max_lat - min_lat) / max(height, 1), 1e-9),
+    )
+
+
+@lru_cache(maxsize=1)
+def default_projected_pixel_size():
+    min_lon, min_lat, max_lon, max_lat = normalize_bbox(
+        DEFAULT_BBOX["min_lon"],
+        DEFAULT_BBOX["min_lat"],
+        DEFAULT_BBOX["max_lon"],
+        DEFAULT_BBOX["max_lat"],
+    )
+    min_x, min_y, max_x, max_y = transform_bounds(
+        GEOGRAPHIC_CRS,
+        PROJECTED_CRS,
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+    )
+    width, height = extent_to_pixel_shape(min_x, min_y, max_x, max_y)
+    return (
+        max((max_x - min_x) / max(width, 1), 1e-6),
+        max((max_y - min_y) / max(height, 1), 1e-6),
+    )
+
+
+def target_pixel_shape_for_extent(min_x, min_y, max_x, max_y, pixel_size, max_dim=DISPLAY_MAX_DIM, min_dim=DISPLAY_MIN_DIM):
+    bounded_width, bounded_height = extent_to_pixel_shape(min_x, min_y, max_x, max_y, max_dim=max_dim, min_dim=min_dim)
+    x_span = max(float(max_x) - float(min_x), 1e-9)
+    y_span = max(float(max_y) - float(min_y), 1e-9)
+    pixel_size_x, pixel_size_y = pixel_size
+    width = max(int(bounded_width), int(math.ceil(x_span / max(float(pixel_size_x), 1e-9))))
+    height = max(int(bounded_height), int(math.ceil(y_span / max(float(pixel_size_y), 1e-9))))
+    return max(width, 1), max(height, 1)
+
+
+def split_dimension(total, max_chunk):
+    total = int(total)
+    max_chunk = int(max_chunk)
+    if total <= 0:
+        return []
+    chunk_count = max(1, int(math.ceil(total / max(max_chunk, 1))))
+    base = total // chunk_count
+    remainder = total % chunk_count
+    return [base + (1 if index < remainder else 0) for index in range(chunk_count)]
+
+
+def raster_request_specs(min_x, min_y, max_x, max_y, width, height, max_request_dim=DISPLAY_MAX_DIM):
+    width_splits = split_dimension(width, max_request_dim)
+    height_splits = split_dimension(height, max_request_dim)
+    x_span = float(max_x) - float(min_x)
+    y_span = float(max_y) - float(min_y)
+    total_width = max(int(width), 1)
+    total_height = max(int(height), 1)
+
+    specs = []
+    row_offset = 0
+    for chunk_height in height_splits:
+        next_row_offset = row_offset + chunk_height
+        chunk_max_y = float(max_y) - (row_offset / total_height) * y_span
+        chunk_min_y = float(max_y) - (next_row_offset / total_height) * y_span
+        col_offset = 0
+        for chunk_width in width_splits:
+            next_col_offset = col_offset + chunk_width
+            chunk_min_x = float(min_x) + (col_offset / total_width) * x_span
+            chunk_max_x = float(min_x) + (next_col_offset / total_width) * x_span
+            specs.append(
+                {
+                    "min_x": chunk_min_x,
+                    "min_y": chunk_min_y,
+                    "max_x": chunk_max_x,
+                    "max_y": chunk_max_y,
+                    "width": int(chunk_width),
+                    "height": int(chunk_height),
+                    "row_offset": int(row_offset),
+                    "col_offset": int(col_offset),
+                }
+            )
+            col_offset = next_col_offset
+        row_offset = next_row_offset
+    return specs
+
+
 def span_to_sample_dim(span_m, target_resolution_m, min_dim, max_dim):
     target_resolution_m = max(float(target_resolution_m), 1e-6)
     sample_dim = int(math.ceil(float(span_m) / target_resolution_m))
@@ -607,6 +829,57 @@ def elevation_export_image_href(min_x, min_y, max_x, max_y, crs, width, height):
         "&f=json"
     )
     return fetch_image_href(meta_url)
+
+
+def fetch_elevation_raster_mosaic(min_x, min_y, max_x, max_y, crs, width, height):
+    width = max(int(width), 1)
+    height = max(int(height), 1)
+    full_transform = rasterio.transform.from_bounds(float(min_x), float(min_y), float(max_x), float(max_y), width, height)
+    mosaic = np.full((height, width), np.nan, dtype=np.float32)
+
+    for spec in raster_request_specs(min_x, min_y, max_x, max_y, width, height):
+        href = elevation_export_image_href(
+            spec["min_x"],
+            spec["min_y"],
+            spec["max_x"],
+            spec["max_y"],
+            crs,
+            spec["width"],
+            spec["height"],
+        )
+        with open_remote_raster(href) as src:
+            source = src.read(1).astype(np.float32)
+            src_transform = rasterio.transform.from_bounds(
+                spec["min_x"],
+                spec["min_y"],
+                spec["max_x"],
+                spec["max_y"],
+                src.width,
+                src.height,
+            )
+            window = rasterio.windows.Window(
+                col_off=spec["col_offset"],
+                row_off=spec["row_offset"],
+                width=spec["width"],
+                height=spec["height"],
+            )
+            destination = mosaic[
+                spec["row_offset"]:spec["row_offset"] + spec["height"],
+                spec["col_offset"]:spec["col_offset"] + spec["width"],
+            ]
+            safe_reproject(
+                source=source,
+                destination=destination,
+                src_transform=src_transform,
+                src_crs=crs,
+                src_nodata=np.nan,
+                dst_transform=rasterio.windows.transform(window, full_transform),
+                dst_crs=crs,
+                dst_nodata=np.nan,
+                resampling=Resampling.bilinear,
+            )
+
+    return mosaic
 
 
 def raster_layer_coordinates(bbox_data):
@@ -942,8 +1215,8 @@ def sample_grid_value(values, lon_axis, lat_axis, longitude, latitude):
     if array.ndim != 2 or lon_axis.size == 0 or lat_axis.size == 0:
         return None
 
-    column_index = int(np.abs(lon_axis - float(longitude)).argmin())
-    row_index = int(np.abs(lat_axis - float(latitude)).argmin())
+    column_index = nearest_axis_index(lon_axis, longitude)
+    row_index = nearest_axis_index(lat_axis, latitude)
     sample = float(array[row_index, column_index])
     if not np.isfinite(sample):
         return None
@@ -1286,10 +1559,10 @@ def build_native_map_spec(
         }
 
         if worldcover_enabled:
-            worldcover_values = np.asarray(
-                bundle.get("worldcover_display", bundle["worldcover_projected"].values),
-                dtype=np.int16,
-            )
+            worldcover_source = bundle.get("worldcover_display")
+            if worldcover_source is None:
+                worldcover_source = cached_bundle_data_array_values(bundle, "worldcover_projected", dtype=np.int16)
+            worldcover_values = np.asarray(worldcover_source, dtype=np.int16)
             worldcover_codes = [
                 int(code)
                 for code in np.unique(worldcover_values)
@@ -1558,9 +1831,9 @@ def build_terrain_dem_tile_png(token, z, x, y):
         raise KeyError(f"Unknown terrain DEM token: {token}")
 
     bundle = get_map_bundle(*cache_key)
-    terrain_display = np.asarray(bundle["terrain_display"], dtype=np.float32)
-    finite = terrain_display[np.isfinite(terrain_display)]
-    fill_value = float(np.nanmin(finite)) if finite.size else 0.0
+    terrain_projected = cached_bundle_data_array_values(bundle, "terrain_projected", dtype=np.float32)
+    source_transform = bundle["projected_transform"]
+    fill_value = float(bundle.get("terrain_fill_value", 0.0))
 
     tile_bbox = tile_lon_lat_bounds(int(x), int(y), int(z))
     if not terrain_tile_intersects_bbox(tile_bbox, bundle["terrain_display_bounds"]):
@@ -1572,12 +1845,19 @@ def build_terrain_dem_tile_png(token, z, x, y):
 
     west, south, east, north = tile_bbox
     mercator_bounds = transform_bounds(GEOGRAPHIC_CRS, WEB_MERCATOR_CRS, west, south, east, north)
+    projected_bounds = transform_bounds(WEB_MERCATOR_CRS, PROJECTED_CRS, *mercator_bounds)
     destination = np.full((TERRAIN_TILE_SIZE, TERRAIN_TILE_SIZE), np.nan, dtype=np.float32)
+    source_values, source_transform = subset_raster_for_bounds(
+        terrain_projected,
+        source_transform,
+        *projected_bounds,
+        padding=1,
+    )
     safe_reproject(
-        source=terrain_display,
+        source=source_values,
         destination=destination,
-        src_transform=bundle["terrain_display_transform"],
-        src_crs=GEOGRAPHIC_CRS,
+        src_transform=source_transform,
+        src_crs=PROJECTED_CRS,
         src_nodata=np.nan,
         dst_transform=rasterio.transform.from_bounds(*mercator_bounds, TERRAIN_TILE_SIZE, TERRAIN_TILE_SIZE),
         dst_crs=WEB_MERCATOR_CRS,
@@ -1695,10 +1975,22 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
         max_lon,
         max_lat,
     )
-    display_width, display_height = geographic_bbox_to_pixel_shape(min_lon, min_lat, max_lon, max_lat)
-    projected_width, projected_height = extent_to_pixel_shape(min_x, min_y, max_x, max_y)
+    display_width, display_height = target_pixel_shape_for_extent(
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+        default_geographic_pixel_size(),
+    )
+    projected_width, projected_height = target_pixel_shape_for_extent(
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        default_projected_pixel_size(),
+    )
 
-    display_terrain_href = elevation_export_image_href(
+    terrain_display = fetch_elevation_raster_mosaic(
         min_lon,
         min_lat,
         max_lon,
@@ -1707,7 +1999,17 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
         display_width,
         display_height,
     )
-    projected_terrain_href = elevation_export_image_href(
+    terrain_display_transform = rasterio.transform.from_bounds(min_lon, min_lat, max_lon, max_lat, display_width, display_height)
+    terrain_display_lon_axis, terrain_display_lat_axis = raster_axes(terrain_display_transform, display_height, display_width)
+    terrain_display_shape = (display_height, display_width)
+    terrain_display_bounds = {
+        "min_lon": float(min_lon),
+        "min_lat": float(min_lat),
+        "max_lon": float(max_lon),
+        "max_lat": float(max_lat),
+    }
+
+    terrain_band = fetch_elevation_raster_mosaic(
         min_x,
         min_y,
         max_x,
@@ -1716,24 +2018,11 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
         projected_width,
         projected_height,
     )
-
-    with open_remote_raster(display_terrain_href) as src:
-        terrain_display = src.read(1).astype(np.float32)
-        terrain_display_transform = rasterio.transform.from_bounds(min_lon, min_lat, max_lon, max_lat, src.width, src.height)
-        terrain_display_lon_axis, terrain_display_lat_axis = raster_axes(terrain_display_transform, src.height, src.width)
-        terrain_display_shape = (src.height, src.width)
-        terrain_display_bounds = {
-            "min_lon": float(min_lon),
-            "min_lat": float(min_lat),
-            "max_lon": float(max_lon),
-            "max_lat": float(max_lat),
-        }
-
-    with open_remote_raster(projected_terrain_href) as src:
-        terrain_band = src.read(1).astype(np.float32)
-        projected_transform = rasterio.transform.from_bounds(min_x, min_y, max_x, max_y, src.width, src.height)
-        projected_shape = (src.height, src.width)
-        terrain_x_axis, terrain_y_axis = raster_axes(projected_transform, src.height, src.width)
+    projected_transform = rasterio.transform.from_bounds(min_x, min_y, max_x, max_y, projected_width, projected_height)
+    projected_shape = (projected_height, projected_width)
+    terrain_x_axis, terrain_y_axis = raster_axes(projected_transform, projected_height, projected_width)
+    terrain_finite = terrain_band[np.isfinite(terrain_band)]
+    terrain_fill_value = float(np.nanmin(terrain_finite)) if terrain_finite.size else 0.0
 
     worldcover_band = np.zeros_like(terrain_band, dtype=np.uint8)
     for worldcover_url in worldcover_tile_urls(min_lon, min_lat, max_lon, max_lat):
@@ -1751,7 +2040,6 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
                 resampling=Resampling.nearest,
                 init_dest_nodata=False,
             )
-
     worldcover_display = np.zeros(terrain_display_shape, dtype=np.uint8)
     safe_reproject(
         source=worldcover_band,
@@ -1771,14 +2059,14 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
         dims=("y", "x"),
         coords={"y": terrain_y_axis, "x": terrain_x_axis},
         name="elevation",
-    ).sortby("y", ascending=False)
+    ).chunk({'x': 1024, 'y': 1024}).sortby("y", ascending=False)
 
     worldcover_projected = xr.DataArray(
         worldcover_band,
         dims=("y", "x"),
         coords={"y": terrain_y_axis, "x": terrain_x_axis},
         name="worldcover",
-    ).sortby("y", ascending=False)
+    ).chunk({'x': 1024, 'y': 1024}).sortby("y", ascending=False)
 
     return {
         "cache_key": (min_lon, min_lat, max_lon, max_lat),
@@ -1794,6 +2082,7 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
         "terrain_display_transform": terrain_display_transform,
         "terrain_display_shape": terrain_display_shape,
         "terrain_display_bounds": terrain_display_bounds,
+        "terrain_fill_value": terrain_fill_value,
         "terrain_projected": terrain_projected,
         "worldcover_display": worldcover_display,
         "worldcover_projected": worldcover_projected,
@@ -1900,23 +2189,37 @@ def ensure_analysis_context(bundle):
     if ANALYSIS_KEY == bundle_key:
         return
 
-    terrain_projected = bundle["terrain_projected"]
-    worldcover_projected = bundle["worldcover_projected"]
+    if ANALYSIS_CONTEXT:
+        clear_analysis_context(run_gc=True)
 
-    ANALYSIS_CONTEXT.clear()
+    terrain_projected = cached_bundle_eager_data_array(bundle, "terrain_projected", dtype=np.float32)
+    worldcover_projected = cached_bundle_eager_data_array(bundle, "worldcover_projected", dtype=np.int16)
+    terrain_values = cached_bundle_data_array_values(bundle, "terrain_projected", dtype=np.float32)
+    worldcover_values = cached_bundle_data_array_values(bundle, "worldcover_projected", dtype=np.int16)
+
     ANALYSIS_CONTEXT.update(
         {
             "terrain_da": terrain_projected,
             "worldcover_da": worldcover_projected,
-            "terrain_values": terrain_projected.values.astype(np.float32),
-            "worldcover_values": worldcover_projected.values.astype(np.int16),
+            "terrain_values": terrain_values,
+            "worldcover_values": worldcover_values,
             "terrain_x": terrain_projected.x.values.astype(np.float64),
             "terrain_y": terrain_projected.y.values.astype(np.float64),
+            "terrain_valid_mask": np.isfinite(terrain_values),
         }
     )
-    snap_point.cache_clear()
-    _get_path_profile_by_index_cached.cache_clear()
     ANALYSIS_KEY = bundle_key
+
+
+def clear_analysis_context(run_gc=False):
+    global ANALYSIS_KEY
+
+    for key in tuple(ANALYSIS_CONTEXT):
+        ANALYSIS_CONTEXT.pop(key, None)
+    _get_path_profile_by_index_cached.cache_clear()
+    ANALYSIS_KEY = None
+    if run_gc:
+        gc.collect()
 
 
 def dist3d(p1, p2):
@@ -1931,13 +2234,44 @@ def dist2d(p1, p2):
     return np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
 
 
-@lru_cache(maxsize=200000)
+def earth_curvature(distance_along_m, total_distance_m, effective_radius_m=EFFECTIVE_EARTH_RADIUS_M):
+    total_distance_m = max(float(total_distance_m), 1e-6)
+    distance_along_m = np.asarray(distance_along_m, dtype=np.float64)
+    remaining_m = np.maximum(total_distance_m - distance_along_m, 0.0)
+    return (distance_along_m * remaining_m) / (2.0 * float(effective_radius_m))
+
+
+def planar_distance_grid_km(x_axis, y_axis, origin_x, origin_y):
+    x_values = np.asarray(x_axis, dtype=np.float64)
+    y_values = np.asarray(y_axis, dtype=np.float64)
+    dx = x_values[np.newaxis, :].astype(np.float64, copy=True)
+    dx -= float(origin_x)
+    dy = y_values[:, np.newaxis].astype(np.float64, copy=True)
+    dy -= float(origin_y)
+
+    distance_km = np.hypot(dx, dy)
+    distance_km /= 1000.0
+    np.maximum(distance_km, 1e-6, out=distance_km)
+    return distance_km
+
+
+@maybe_njit(cache=False)
+def _earth_curvature_numba(distance_along_m, total_distance_m, effective_radius_m):
+    if total_distance_m <= 0.0:
+        return 0.0
+    remaining_m = total_distance_m - distance_along_m
+    if remaining_m < 0.0:
+        remaining_m = 0.0
+    return (distance_along_m * remaining_m) / (2.0 * effective_radius_m)
+
+
+
 def snap_point(x_coord, y_coord):
     terrain_x = ANALYSIS_CONTEXT["terrain_x"]
     terrain_y = ANALYSIS_CONTEXT["terrain_y"]
     terrain_values = ANALYSIS_CONTEXT["terrain_values"]
-    col = int(np.abs(terrain_x - x_coord).argmin())
-    row = int(np.abs(terrain_y - y_coord).argmin())
+    col = nearest_axis_index(terrain_x, x_coord)
+    row = nearest_axis_index(terrain_y, y_coord)
     return row, col, float(terrain_x[col]), float(terrain_y[row]), float(terrain_values[row, col])
 
 
@@ -2046,7 +2380,12 @@ def _path_loss_only_by_index(
         prev_y = y
 
         path_fraction = distance_along_m / total_distance_m
-        line_z = z1 + (z2 - z1) * path_fraction
+        curvature_bulge = _earth_curvature_numba(
+            distance_along_m,
+            total_distance_m,
+            EFFECTIVE_EARTH_RADIUS_M,
+        )
+        line_z = z1 + (z2 - z1) * path_fraction - curvature_bulge
 
         dx1 = x - x1
         dy1 = y - y1
@@ -2117,6 +2456,46 @@ def _compute_ground_loss_batch_numba(
             legacy_sample_spacing_m,
             offset_lookup,
             attenuation_lookup,
+    )
+    return losses
+
+
+@maybe_njit(cache=False)
+def _compute_ground_loss_batch_numba_serial(
+    terrain_values,
+    worldcover_values,
+    terrain_x,
+    terrain_y,
+    observer_row,
+    observer_col,
+    target_rows,
+    target_cols,
+    observer_height,
+    target_height,
+    min_samples,
+    sample_spacing_m,
+    legacy_sample_spacing_m,
+    offset_lookup,
+    attenuation_lookup,
+):
+    losses = np.empty(target_rows.shape[0], dtype=np.float32)
+    for index in range(target_rows.shape[0]):
+        losses[index] = _path_loss_only_by_index(
+            terrain_values,
+            worldcover_values,
+            terrain_x,
+            terrain_y,
+            int(observer_row),
+            int(observer_col),
+            int(target_rows[index]),
+            int(target_cols[index]),
+            observer_height,
+            target_height,
+            min_samples,
+            sample_spacing_m,
+            legacy_sample_spacing_m,
+            offset_lookup,
+            attenuation_lookup,
         )
     return losses
 
@@ -2140,7 +2519,7 @@ def normalize_target_indices(target_rows_or_cells, target_cols=None):
     return cells[:, 0].astype(np.int32, copy=False), cells[:, 1].astype(np.int32, copy=False)
 
 
-@lru_cache(maxsize=200000)
+@lru_cache(maxsize=PATH_PROFILE_CACHE_MAXSIZE)
 def _get_path_profile_by_index_cached(row1, col1, row2, col2, observer_height=0.0, target_height=0.0, min_samples=2):
     terrain_x = ANALYSIS_CONTEXT["terrain_x"]
     terrain_y = ANALYSIS_CONTEXT["terrain_y"]
@@ -2172,9 +2551,10 @@ def _get_path_profile_by_index_cached(row1, col1, row2, col2, observer_height=0.
         path_fraction = distance_along_m / total_distance_m
     else:
         distance_along_m = np.array([0.0], dtype=np.float64)
+        total_distance_m = 1e-6
         path_fraction = np.array([0.0], dtype=np.float64)
 
-    line_z = pos1[2] + (pos2[2] - pos1[2]) * path_fraction
+    line_z = pos1[2] + (pos2[2] - pos1[2]) * path_fraction - earth_curvature(distance_along_m, total_distance_m)
     d1 = np.sqrt((x_path - pos1[0]) ** 2 + (y_path - pos1[1]) ** 2 + (line_z - pos1[2]) ** 2)
     d2 = np.sqrt((x_path - pos2[0]) ** 2 + (y_path - pos2[1]) ** 2 + (line_z - pos2[2]) ** 2)
     fresnel = np.sqrt((0.3304 * d1 * d2) / np.maximum(d1 + d2, 1e-6))
@@ -2265,7 +2645,7 @@ def get_path_losses_by_index(row1, col1, row2, col2, observer_height=0.0, target
     return loss_db
 
 
-def compute_ground_loss_for_chunk(args):
+def compute_ground_loss_for_chunk(args, use_parallel_numba=True):
     if len(args) == 5:
         observer_row, observer_col, cells, observer_height, target_height = args
         rows, cols = normalize_target_indices(cells)
@@ -2284,7 +2664,8 @@ def compute_ground_loss_for_chunk(args):
         return rows, cols, np.empty(0, dtype=np.float32)
     sample_spacing_m = normalize_rssi_path_sample_spacing(sample_spacing_m)
 
-    losses = _compute_ground_loss_batch_numba(
+    compute_fn = _compute_ground_loss_batch_numba if use_parallel_numba else _compute_ground_loss_batch_numba_serial
+    losses = compute_fn(
         ANALYSIS_CONTEXT["terrain_values"],
         ANALYSIS_CONTEXT["worldcover_values"],
         ANALYSIS_CONTEXT["terrain_x"],
@@ -2401,9 +2782,13 @@ def compute_path_loss(
         path_fraction = distance_along_m / total_distance_m
     else:
         distance_along_m = np.array([0.0], dtype=np.float64)
+        total_distance_m = 1e-6
         path_fraction = np.array([0.0], dtype=np.float64)
 
+    curvature_bulge = earth_curvature(distance_along_m, total_distance_m)
     los_line = tx_z + (rx_z - tx_z) * path_fraction
+    curved_terrain_profile = terrain_profile + curvature_bulge
+    curved_obstruction_top = obstruction_top + curvature_bulge
     p1 = (x1, y1, tx_z)
     p2 = (x2, y2, rx_z)
 
@@ -2431,12 +2816,12 @@ def compute_path_loss(
         "rssi_dbm": float(rssi_dbm),
         "attenuation_event_count": int(np.count_nonzero(blockage_fraction > 0)),
         "terrain_collision_event_count": int(np.count_nonzero(terrain_only_blocked)),
-        "direct_los_collision_count": int(np.count_nonzero(obstruction_top >= los_line)),
+        "direct_los_collision_count": int(np.count_nonzero(curved_obstruction_top >= los_line)),
         "path_loss_db": float(path_loss_db),
         "link_distance_km": float(link_distance_km),
         "distance_along_km": distance_along_m / 1000.0,
-        "terrain_profile_m": terrain_profile,
-        "obstruction_top_m": obstruction_top,
+        "terrain_profile_m": curved_terrain_profile,
+        "obstruction_top_m": curved_obstruction_top,
         "los_line_m": los_line,
         "fresnel_upper_m": fresnel_upper,
         "fresnel_lower_m": fresnel_lower,
@@ -2444,7 +2829,7 @@ def compute_path_loss(
         "attenuation_per_sample_db": attenuation_per_sample,
         "terrain_only_blocked": terrain_only_blocked,
         "worldcover_classes": worldcover_profile,
-        "direct_los_hits": obstruction_top >= los_line,
+        "direct_los_hits": curved_obstruction_top >= los_line,
         "path_longitude": np.asarray(path_longitude, dtype=np.float64),
         "path_latitude": np.asarray(path_latitude, dtype=np.float64),
     }
@@ -2559,6 +2944,66 @@ def bounded_cache_put(cache, key, value, max_size=8):
         cache.pop(next(iter(cache)))
 
 
+def bounded_dask_worker_count(task_count, max_workers):
+    if int(task_count) <= 1:
+        return 1
+    cpu_total = max(int(os.cpu_count() or 1), 1)
+    return max(1, min(int(task_count), cpu_total, int(max_workers)))
+
+
+def rssi_dask_worker_count(task_count):
+    return bounded_dask_worker_count(task_count, RSSI_DASK_MAX_WORKERS)
+
+
+def compute_dask_tasks(tasks, use_threads=True):
+    delayed_tasks = list(tasks or [])
+    if not delayed_tasks:
+        return tuple()
+    if not use_threads:
+        return dask.compute(
+            *delayed_tasks,
+            scheduler="single-threaded",
+        )
+    if len(delayed_tasks) == 1:
+        return (
+            delayed_tasks[0].compute(
+                scheduler="threads",
+                num_workers=1,
+            ),
+        )
+    return dask.compute(
+        *delayed_tasks,
+        scheduler="threads",
+        num_workers=rssi_dask_worker_count(len(delayed_tasks)),
+    )
+
+
+def numba_parallel_threads_safe():
+    if njit is None:
+        return True
+    try:
+        from numba import threading_layer
+
+        return str(threading_layer()).lower() in {"tbb", "omp"}
+    except Exception:
+        return False
+
+
+def format_elapsed_time(seconds):
+    elapsed = max(float(seconds), 0.0)
+    if elapsed < 1.0:
+        return f"{elapsed * 1000.0:.0f} ms"
+    if elapsed < 60.0:
+        return f"{elapsed:.2f} s"
+    minutes = int(elapsed // 60.0)
+    remaining_seconds = elapsed - (minutes * 60.0)
+    if minutes < 60:
+        return f"{minutes}m {remaining_seconds:.1f}s"
+    hours = minutes // 60
+    remaining_minutes = minutes % 60
+    return f"{hours}h {remaining_minutes}m {remaining_seconds:.0f}s"
+
+
 def send_desktop_notification(title, message):
     if DESKTOP_NOTIFIER is None:
         return False
@@ -2641,7 +3086,7 @@ def interpolate_viewshed_rbf(sample_points, sample_scores, target_points):
     interpolator = RBFInterpolator(
         sample_points,
         sample_scores,
-        kernel="linear",
+        kernel="thin_plate_spline",
         smoothing=0.0,
     )
     return np.asarray(interpolator(target_points), dtype=np.float32)
@@ -2712,7 +3157,7 @@ def compute_viewshed_assessment(
 
     ensure_analysis_context(bundle)
     full_terrain_da = ANALYSIS_CONTEXT["terrain_da"]
-    full_valid_mask = np.isfinite(np.asarray(full_terrain_da.values, dtype=np.float32))
+    full_valid_mask = ANALYSIS_CONTEXT["terrain_valid_mask"]
 
     terrain_window = get_viewshed_assessment_terrain(longitude, latitude, radius_m)
     terrain_da = terrain_window["terrain_da"]
@@ -2728,8 +3173,8 @@ def compute_viewshed_assessment(
         [float(longitude)],
         [float(latitude)],
     )
-    center_row = int(np.abs(terrain_y - float(projected_y[0])).argmin())
-    center_col = int(np.abs(terrain_x - float(projected_x[0])).argmin())
+    center_row = nearest_axis_index(terrain_y, float(projected_y[0]))
+    center_col = nearest_axis_index(terrain_x, float(projected_x[0]))
     x_step = float(abs(terrain_x[1] - terrain_x[0]))
     y_step = float(abs(terrain_y[1] - terrain_y[0]))
     radius_m = max(float(radius_m), max(x_step, y_step))
@@ -2760,21 +3205,32 @@ def compute_viewshed_assessment(
         radius_m,
         effective_sample_count,
     )
-    sampled_scores = []
-    sampled_points = []
+    valid_sample_points = []
     for sample_x, sample_y in sample_points:
         if sample_x < local_min_x or sample_x > local_max_x or sample_y < local_min_y or sample_y > local_max_y:
             continue
-        visible = viewshed(
-            full_terrain_da,
-            x=float(sample_x),
-            y=float(sample_y),
-            observer_elev=float(observer_height_agl),
-            target_elev=0.0,
+        valid_sample_points.append((float(sample_x), float(sample_y)))
+
+    sampled_points = valid_sample_points
+    sampled_scores = []
+    if sampled_points:
+        sample_tasks = [
+            dask.delayed(compute_viewshed_sample_score)(
+                sample_x,
+                sample_y,
+                full_terrain_da,
+                observer_height_agl,
+                full_valid_mask,
+            )
+            for sample_x, sample_y in sampled_points
+        ]
+        sampled_scores = list(
+            dask.compute(
+                *sample_tasks,
+                scheduler="threads",
+                num_workers=bounded_dask_worker_count(len(sample_tasks), VIEWSHED_DASK_MAX_WORKERS),
+            )
         )
-        visible_mask = np.asarray(visible > 0)
-        sampled_points.append((float(sample_x), float(sample_y)))
-        sampled_scores.append(float(np.count_nonzero(visible_mask & full_valid_mask)))
 
     if not sampled_scores:
         return None, None
@@ -2877,6 +3333,18 @@ def compute_bidirectional_link_result(source, target):
     }
 
 
+def compute_viewshed_sample_score(sample_x, sample_y, terrain_da, observer_height_agl, full_valid_mask):
+    visible = viewshed(
+        terrain_da,
+        x=float(sample_x),
+        y=float(sample_y),
+        observer_elev=float(observer_height_agl),
+        target_elev=0.0,
+    )
+    visible_mask = np.asarray(visible > 0)
+    return float(np.count_nonzero(visible_mask & full_valid_mask))
+
+
 def compute_link_results(nodes, bundle):
     if len(nodes) < 2:
         return []
@@ -2908,6 +3376,88 @@ def compute_link_results(nodes, bundle):
     return link_results
 
 
+def compute_observer_projected_rssi(
+    observer,
+    terrain_da,
+    terrain_x,
+    terrain_y,
+    global_rx_height_agl_m,
+    global_rx_gain_dbi,
+    include_ground_loss=False,
+    sample_spacing_m=DEFAULT_RSSI_PATH_SAMPLE_SPACING_M,
+    minimum_rssi_dbm=None,
+    min_distance_km=None,
+    use_parallel_ground_loss_numba=True,
+):
+    sample_spacing_m = normalize_rssi_path_sample_spacing(sample_spacing_m)
+    vs = viewshed(
+        terrain_da,
+        x=observer.x,
+        y=observer.y,
+        observer_elev=observer.observer_elev,
+        target_elev=float(global_rx_height_agl_m),
+    )
+    visible_mask = np.asarray(vs > 0)
+    distance_km = planar_distance_grid_km(terrain_x, terrain_y, observer.x, observer.y)
+    ground_loss_db = np.zeros(terrain_da.shape, dtype=np.float32)
+
+    if include_ground_loss:
+        observer_row, observer_col, _obs_x, _obs_y, _obs_z = snap_point(observer.x, observer.y)
+        visible_rows, visible_cols = np.nonzero(visible_mask)
+        if visible_rows.size:
+            chunk_rows, chunk_cols, chunk_losses = compute_ground_loss_for_chunk(
+                (
+                    observer_row,
+                    observer_col,
+                    visible_rows,
+                    visible_cols,
+                    float(observer.observer_elev),
+                    float(global_rx_height_agl_m),
+                    float(sample_spacing_m),
+                ),
+                use_parallel_numba=use_parallel_ground_loss_numba,
+            )
+            ground_loss_db[chunk_rows, chunk_cols] = chunk_losses
+
+    observer_rssi = np.where(
+        visible_mask,
+        received_power_dbm(
+            distance_km,
+            DEFAULT_FREQ_MHZ,
+            float(observer.tx_power_dbm),
+            tx_gain_dbi=float(observer.antenna_gain_dbi),
+            rx_gain_dbi=float(global_rx_gain_dbi),
+            other_losses_db=DEFAULT_OTHER_LOSSES_DB + ground_loss_db,
+        ),
+        np.nan,
+    )
+    if min_distance_km is not None:
+        observer_rssi = np.where(distance_km > float(min_distance_km), observer_rssi, np.nan)
+    if minimum_rssi_dbm is not None:
+        observer_rssi = np.where(observer_rssi >= float(minimum_rssi_dbm), observer_rssi, np.nan)
+    return np.asarray(observer_rssi, dtype=np.float32)
+
+
+def reproject_projected_rssi_to_display(observer_rssi, bundle):
+    display_rssi = np.full(bundle["terrain_display_shape"], np.nan, dtype=np.float32)
+    safe_reproject(
+        source=np.asarray(observer_rssi, dtype=np.float32),
+        destination=display_rssi,
+        src_transform=bundle["projected_transform"],
+        src_crs=PROJECTED_CRS,
+        src_nodata=np.nan,
+        dst_transform=bundle["terrain_display_transform"],
+        dst_crs=GEOGRAPHIC_CRS,
+        dst_nodata=np.nan,
+        resampling=Resampling.bilinear,
+    )
+    return {
+        "max_rssi": np.flipud(display_rssi),
+        "lon_axis": bundle["terrain_display_lon_axis"],
+        "lat_axis": bundle["terrain_display_lat_axis"][::-1],
+    }
+
+
 def compute_node_rssi_summaries(
     nodes,
     bundle,
@@ -2921,58 +3471,36 @@ def compute_node_rssi_summaries(
     ensure_analysis_context(bundle)
     observer_frame = build_observer_frame(nodes)
     terrain_da = ANALYSIS_CONTEXT["terrain_da"]
-    x_grid, y_grid = np.meshgrid(terrain_da.x.values, terrain_da.y.values)
+    terrain_x = ANALYSIS_CONTEXT["terrain_x"]
+    terrain_y = ANALYSIS_CONTEXT["terrain_y"]
     sample_spacing_m = normalize_rssi_path_sample_spacing(sample_spacing_m)
+    use_parallel_ground_loss_numba = numba_parallel_threads_safe()
 
-    x_step = float(abs(terrain_da.x.values[1] - terrain_da.x.values[0])) if terrain_da.x.size > 1 else 0.0
-    y_step = float(abs(terrain_da.y.values[1] - terrain_da.y.values[0])) if terrain_da.y.size > 1 else 0.0
+    x_step = float(abs(terrain_x[1] - terrain_x[0])) if terrain_x.size > 1 else 0.0
+    y_step = float(abs(terrain_y[1] - terrain_y[0])) if terrain_y.size > 1 else 0.0
     cell_area_km2 = (x_step * y_step) / 1_000_000.0 if x_step and y_step else 0.0
 
-    summaries = {}
-    for observer in observer_frame.itertuples(index=False):
-        vs = viewshed(
+    observers = list(observer_frame.itertuples(index=False))
+    tasks = [
+        dask.delayed(compute_observer_projected_rssi)(
+            observer,
             terrain_da,
-            x=observer.x,
-            y=observer.y,
-            observer_elev=observer.observer_elev,
-            target_elev=float(global_rx_height_agl_m),
+            terrain_x,
+            terrain_y,
+            global_rx_height_agl_m,
+            global_rx_gain_dbi,
+            include_ground_loss=True,
+            sample_spacing_m=sample_spacing_m,
+            minimum_rssi_dbm=None,
+            min_distance_km=0.05,
+            use_parallel_ground_loss_numba=use_parallel_ground_loss_numba,
         )
-        visible_mask = np.asarray(vs > 0)
-        observer_row, observer_col, _obs_x, _obs_y, _obs_z = snap_point(observer.x, observer.y)
+        for observer in observers
+    ]
+    observer_rssi_results = compute_dask_tasks(tasks, use_threads=True)
 
-        distance_km = np.sqrt((x_grid - observer.x) ** 2 + (y_grid - observer.y) ** 2) / 1000.0
-        distance_km = np.maximum(distance_km, 1e-6)
-        ground_loss_db = np.zeros(terrain_da.shape, dtype=np.float32)
-
-        visible_rows, visible_cols = np.nonzero(visible_mask)
-        if visible_rows.size:
-            chunk_rows, chunk_cols, chunk_losses = compute_ground_loss_for_chunk(
-                (
-                    observer_row,
-                    observer_col,
-                    visible_rows,
-                    visible_cols,
-                    float(observer.observer_elev),
-                    float(global_rx_height_agl_m),
-                    float(sample_spacing_m),
-                )
-            )
-            ground_loss_db[chunk_rows, chunk_cols] = chunk_losses
-
-        observer_rssi = np.where(
-            visible_mask,
-            received_power_dbm(
-                distance_km,
-                DEFAULT_FREQ_MHZ,
-                float(observer.tx_power_dbm),
-                tx_gain_dbi=float(observer.antenna_gain_dbi),
-                rx_gain_dbi=float(global_rx_gain_dbi),
-                other_losses_db=DEFAULT_OTHER_LOSSES_DB + ground_loss_db,
-            ),
-            np.nan,
-        )
-
-        observer_rssi = np.where(distance_km > 0.05, observer_rssi, np.nan)
+    summaries = {}
+    for observer, observer_rssi in zip(observers, observer_rssi_results, strict=False):
         valid = observer_rssi[np.isfinite(observer_rssi)]
         valid_above_floor = valid[valid >= MIN_LINK_RSSI_DBM]
         summaries[str(observer.id)] = {
@@ -3010,74 +3538,75 @@ def compute_rssi_overlay(
     ensure_analysis_context(bundle)
     observer_frame = build_observer_frame(normalized_nodes)
     terrain_da = ANALYSIS_CONTEXT["terrain_da"]
-    x_grid, y_grid = np.meshgrid(terrain_da.x.values, terrain_da.y.values)
+    terrain_x = ANALYSIS_CONTEXT["terrain_x"]
+    terrain_y = ANALYSIS_CONTEXT["terrain_y"]
     max_rssi = np.full(terrain_da.shape, np.nan, dtype=np.float32)
     sample_spacing_m = normalize_rssi_path_sample_spacing(sample_spacing_m)
+    use_parallel_ground_loss_numba = include_ground_loss and numba_parallel_threads_safe()
 
-    for observer in observer_frame.itertuples(index=False):
-        vs = viewshed(
+    observers = list(observer_frame.itertuples(index=False))
+    tasks = [
+        dask.delayed(compute_observer_projected_rssi)(
+            observer,
             terrain_da,
-            x=observer.x,
-            y=observer.y,
-            observer_elev=observer.observer_elev,
-            target_elev=float(global_rx_height_agl_m),
+            terrain_x,
+            terrain_y,
+            global_rx_height_agl_m,
+            global_rx_gain_dbi,
+            include_ground_loss=include_ground_loss,
+            sample_spacing_m=sample_spacing_m,
+            minimum_rssi_dbm=MIN_LINK_RSSI_DBM,
+            min_distance_km=None,
+            use_parallel_ground_loss_numba=use_parallel_ground_loss_numba,
         )
-        visible_mask = np.asarray(vs > 0)
-        distance_km = np.sqrt((x_grid - observer.x) ** 2 + (y_grid - observer.y) ** 2) / 1000.0
-        distance_km = np.maximum(distance_km, 1e-6)
-        ground_loss_db = np.zeros(terrain_da.shape, dtype=np.float32)
+        for observer in observers
+    ]
+    observer_rssi_results = compute_dask_tasks(tasks, use_threads=True)
+    for observer_rssi in observer_rssi_results:
+        max_rssi = np.fmax(max_rssi, observer_rssi)
 
-        if include_ground_loss:
-            observer_row, observer_col, _obs_x, _obs_y, _obs_z = snap_point(observer.x, observer.y)
-            visible_rows, visible_cols = np.nonzero(visible_mask)
-            if visible_rows.size:
-                chunk_rows, chunk_cols, chunk_losses = compute_ground_loss_for_chunk(
-                    (
-                        observer_row,
-                        observer_col,
-                        visible_rows,
-                        visible_cols,
-                        float(observer.observer_elev),
-                        float(global_rx_height_agl_m),
-                        float(sample_spacing_m),
-                    )
-                )
-                ground_loss_db[chunk_rows, chunk_cols] = chunk_losses
-
-        observer_rssi = np.where(
-            visible_mask,
-            received_power_dbm(
-                distance_km,
-                DEFAULT_FREQ_MHZ,
-                float(observer.tx_power_dbm),
-                tx_gain_dbi=float(observer.antenna_gain_dbi),
-                rx_gain_dbi=float(global_rx_gain_dbi),
-                other_losses_db=DEFAULT_OTHER_LOSSES_DB + ground_loss_db,
-            ),
-            np.nan,
-        )
-        observer_rssi = np.where(observer_rssi >= MIN_LINK_RSSI_DBM, observer_rssi, np.nan)
-        max_rssi = np.fmax(max_rssi, observer_rssi.astype(np.float32))
-
-    display_rssi = np.full(bundle["terrain_display_shape"], np.nan, dtype=np.float32)
-    safe_reproject(
-        source=max_rssi,
-        destination=display_rssi,
-        src_transform=bundle["projected_transform"],
-        src_crs=PROJECTED_CRS,
-        src_nodata=np.nan,
-        dst_transform=bundle["terrain_display_transform"],
-        dst_crs=GEOGRAPHIC_CRS,
-        dst_nodata=np.nan,
-        resampling=Resampling.bilinear,
-    )
-    result = {
-        "max_rssi": np.flipud(display_rssi),
-        "lon_axis": bundle["terrain_display_lon_axis"],
-        "lat_axis": bundle["terrain_display_lat_axis"][::-1],
-    }
+    result = reproject_projected_rssi_to_display(max_rssi, bundle)
     RSSI_OVERLAY_CACHE[cache_key] = result
     return result
+
+
+def compute_single_node_rssi_overlay_result(
+    node,
+    bundle,
+    include_ground_loss,
+    global_rx_height_agl_m,
+    global_rx_gain_dbi,
+    sample_spacing_m=DEFAULT_RSSI_PATH_SAMPLE_SPACING_M,
+    use_parallel_ground_loss_numba=True,
+):
+    normalized = with_node_defaults(node)
+    cache_key = overlay_cache_key(
+        bundle,
+        [normalized],
+        include_ground_loss,
+        global_rx_height_agl_m,
+        global_rx_gain_dbi,
+        sample_spacing_m=sample_spacing_m,
+    )
+    observer_frame = build_observer_frame([normalized])
+    terrain_da = ANALYSIS_CONTEXT["terrain_da"]
+    terrain_x = ANALYSIS_CONTEXT["terrain_x"]
+    terrain_y = ANALYSIS_CONTEXT["terrain_y"]
+    observer = next(observer_frame.itertuples(index=False))
+    observer_rssi = compute_observer_projected_rssi(
+        observer,
+        terrain_da,
+        terrain_x,
+        terrain_y,
+        global_rx_height_agl_m,
+        global_rx_gain_dbi,
+        include_ground_loss=include_ground_loss,
+        sample_spacing_m=sample_spacing_m,
+        minimum_rssi_dbm=MIN_LINK_RSSI_DBM,
+        min_distance_km=None,
+        use_parallel_ground_loss_numba=use_parallel_ground_loss_numba,
+    )
+    return cache_key, reproject_projected_rssi_to_display(observer_rssi, bundle)
 
 
 def compute_single_node_rssi_overlay(
@@ -3101,72 +3630,16 @@ def compute_single_node_rssi_overlay(
         return cache_key, RSSI_OVERLAY_CACHE[cache_key]
 
     ensure_analysis_context(bundle)
-    observer_frame = build_observer_frame([normalized])
-    terrain_da = ANALYSIS_CONTEXT["terrain_da"]
-    x_grid, y_grid = np.meshgrid(terrain_da.x.values, terrain_da.y.values)
-    observer = next(observer_frame.itertuples(index=False))
     sample_spacing_m = normalize_rssi_path_sample_spacing(sample_spacing_m)
-
-    vs = viewshed(
-        terrain_da,
-        x=observer.x,
-        y=observer.y,
-        observer_elev=observer.observer_elev,
-        target_elev=float(global_rx_height_agl_m),
+    cache_key, result = compute_single_node_rssi_overlay_result(
+        normalized,
+        bundle,
+        include_ground_loss,
+        global_rx_height_agl_m,
+        global_rx_gain_dbi,
+        sample_spacing_m=sample_spacing_m,
+        use_parallel_ground_loss_numba=include_ground_loss and numba_parallel_threads_safe(),
     )
-    visible_mask = np.asarray(vs > 0)
-    distance_km = np.sqrt((x_grid - observer.x) ** 2 + (y_grid - observer.y) ** 2) / 1000.0
-    distance_km = np.maximum(distance_km, 1e-6)
-    ground_loss_db = np.zeros(terrain_da.shape, dtype=np.float32)
-
-    if include_ground_loss:
-        observer_row, observer_col, _obs_x, _obs_y, _obs_z = snap_point(observer.x, observer.y)
-        visible_rows, visible_cols = np.nonzero(visible_mask)
-        if visible_rows.size:
-            chunk_rows, chunk_cols, chunk_losses = compute_ground_loss_for_chunk(
-                (
-                    observer_row,
-                    observer_col,
-                    visible_rows,
-                    visible_cols,
-                    float(observer.observer_elev),
-                    float(global_rx_height_agl_m),
-                    float(sample_spacing_m),
-                )
-            )
-            ground_loss_db[chunk_rows, chunk_cols] = chunk_losses
-
-    observer_rssi = np.where(
-        visible_mask,
-        received_power_dbm(
-            distance_km,
-            DEFAULT_FREQ_MHZ,
-            float(observer.tx_power_dbm),
-            tx_gain_dbi=float(observer.antenna_gain_dbi),
-            rx_gain_dbi=float(global_rx_gain_dbi),
-            other_losses_db=DEFAULT_OTHER_LOSSES_DB + ground_loss_db,
-        ),
-        np.nan,
-    )
-    observer_rssi = np.where(observer_rssi >= MIN_LINK_RSSI_DBM, observer_rssi, np.nan)
-
-    display_rssi = np.full(bundle["terrain_display_shape"], np.nan, dtype=np.float32)
-    safe_reproject(
-        source=observer_rssi.astype(np.float32),
-        destination=display_rssi,
-        src_transform=bundle["projected_transform"],
-        src_crs=PROJECTED_CRS,
-        src_nodata=np.nan,
-        dst_transform=bundle["terrain_display_transform"],
-        dst_crs=GEOGRAPHIC_CRS,
-        dst_nodata=np.nan,
-        resampling=Resampling.bilinear,
-    )
-    result = {
-        "max_rssi": np.flipud(display_rssi),
-        "lon_axis": bundle["terrain_display_lon_axis"],
-        "lat_axis": bundle["terrain_display_lat_axis"][::-1],
-    }
     RSSI_OVERLAY_CACHE[cache_key] = result
     return cache_key, result
 
@@ -5546,6 +6019,7 @@ def generate_viewshed_assessment(
     viewshed_radius = float(viewshed_radius or VIEWSHED_ASSESSMENT_RADIUS_M)
     viewshed_height_agl = float(viewshed_height_agl or VIEWSHED_ASSESSMENT_OBSERVER_HEIGHT_AGL_M)
     effective_sample_count = effective_viewshed_sample_count(viewshed_sample_count)
+    started_at = time.perf_counter()
 
     try:
         bbox = normalize_bbox(
@@ -5564,11 +6038,13 @@ def generate_viewshed_assessment(
         )
         if not cache_key or result is None:
             return {"error": "Max LOS calculation did not produce any visible-cell values."}, {"mode": "none", "node_id": None}
+        elapsed = time.perf_counter() - started_at
         send_desktop_notification(
             "Viewshed Assessment Complete",
             (
                 f"Computed Max LOS for {int(round(viewshed_radius))} m radius at "
-                f"{viewshed_height_agl:.1f} m AGL using {int(effective_sample_count)} samples."
+                f"{viewshed_height_agl:.1f} m AGL using {int(effective_sample_count)} samples in "
+                f"{format_elapsed_time(elapsed)}."
             ),
         )
         return {
@@ -5670,7 +6146,10 @@ def generate_rssi_overlay(
     sample_spacing_m = normalize_rssi_path_sample_spacing(rssi_path_sample_spacing_m)
     node_overlay_keys = {}
     node_signatures = {}
+    started_at = time.perf_counter()
     try:
+        ensure_analysis_context(bundle)
+        use_parallel_ground_loss_numba = include_ground_loss and numba_parallel_threads_safe()
         progress = tqdm(
             nodes,
             total=len(nodes),
@@ -5680,15 +6159,22 @@ def generate_rssi_overlay(
             leave=True,
         )
         try:
-            for node in progress:
-                cache_key, _result = compute_single_node_rssi_overlay(
+            scheduled_nodes = [with_node_defaults(node) for node in progress]
+            overlay_tasks = [
+                dask.delayed(compute_single_node_rssi_overlay_result)(
                     node,
                     bundle,
                     include_ground_loss,
                     rx_height,
                     rx_gain,
                     sample_spacing_m=sample_spacing_m,
+                    use_parallel_ground_loss_numba=use_parallel_ground_loss_numba,
                 )
+                for node in scheduled_nodes
+            ]
+            overlay_results = compute_dask_tasks(overlay_tasks, use_threads=True)
+            for node, (cache_key, overlay_result) in zip(scheduled_nodes, overlay_results, strict=False):
+                RSSI_OVERLAY_CACHE[cache_key] = overlay_result
                 node_id = str(node["id"])
                 node_overlay_keys[node_id] = cache_key
                 node_signatures[node_id] = node_signature(node)
@@ -5723,12 +6209,15 @@ def generate_rssi_overlay(
         for node in nodes
     }
     mode = "with path attenuation" if include_ground_loss else "with viewshed + FSPL only"
+    elapsed = time.perf_counter() - started_at
+    sampling_text = f" with {sample_spacing_m:.0f} m path samples" if include_ground_loss else ""
     send_desktop_notification(
         "RSSI Overlay Complete",
         (
             f"Computed RSSI overlay for {len(nodes)} nodes {mode} at "
             f"{float(rx_height):.1f} m AGL / {float(rx_gain):.1f} dBi"
-            f"{f' with {sample_spacing_m:.0f} m path samples.' if include_ground_loss else '.'}"
+            f"{sampling_text}"
+            f" in {format_elapsed_time(elapsed)}."
         ),
     )
     return (

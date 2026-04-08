@@ -24,9 +24,9 @@
   const VIEWSHED_RADIUS_LAYER_ID = "mesh-terrain-viewshed-radius-line";
   const VIEWSHED_SAMPLES_LAYER_ID = "mesh-terrain-viewshed-samples-circle";
   const BASEMAP_LAYER_ID = "basemap";
-  const DEFAULT_NODE_HEIGHT_M = 8.0;
-  const DEFAULT_TX_GAIN_DBI = 6.0;
-  const DEFAULT_TX_POWER_DBM = 30.0;
+  const DEFAULT_NODE_HEIGHT_M = 2.0;
+  const DEFAULT_TX_GAIN_DBI = 5.0;
+  const DEFAULT_TX_POWER_DBM = 22.0;
   const SVG_NS = "http://www.w3.org/2000/svg";
 
   const COORDINATE_CAPTURE_MODES = new Set(["add-node", "move-node", "point-path", "terrain-bbox", "viewshed-point"]);
@@ -130,9 +130,9 @@
       name: name,
       longitude: Number(longitude),
       latitude: Number(latitude),
-      height_agl_m: 8.0,
-      antenna_gain_dbi: 6.0,
-      tx_power_dbm: 30.0,
+      height_agl_m: DEFAULT_NODE_HEIGHT_M,
+      antenna_gain_dbi: DEFAULT_TX_GAIN_DBI,
+      tx_power_dbm: DEFAULT_TX_POWER_DBM,
     });
     return {
       nodes: nextNodes,

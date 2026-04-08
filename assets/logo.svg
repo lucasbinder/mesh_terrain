@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 282.09 224.09">
+<svg id="Layer_1" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 288 288">
+  <!-- Generator: Adobe Illustrator 30.2.1, SVG Export Plug-In . SVG Version: 2.1.1 Build 1)  -->
   <defs>
     <style>
-      .cls-1 {
+      .st0 {
         fill: none;
         stroke: #fff;
         stroke-linecap: round;
@@ -11,24 +12,25 @@
       }
     </style>
   </defs>
-  <circle class="cls-1" cx="142.11" cy="11.7" r="8.7"/>
-  <circle class="cls-1" cx="11.7" cy="194.98" r="8.7"/>
-  <circle class="cls-1" cx="169.7" cy="212.39" r="8.7"/>
-  <circle class="cls-1" cx="270.39" cy="186.28" r="8.7"/>
-  <circle class="cls-1" cx="171.08" cy="147.36" r="8.7"/>
-  <circle class="cls-1" cx="77.8" cy="73.22" r="8.7"/>
-  <line class="cls-1" x1="73.56" y1="80.82" x2="15.17" y2="187"/>
-  <line class="cls-1" x1="229.6" y1="196.34" x2="261.69" y2="186.28"/>
-  <line class="cls-1" x1="178.4" y1="212.39" x2="213.02" y2="201.54"/>
-  <line class="cls-1" x1="107.04" y1="207.25" x2="161" y2="212.39"/>
-  <polyline class="cls-1" points="133.89 14.54 20.41 194.98 89.64 205.54"/>
-  <line class="cls-1" x1="85.69" y1="76.9" x2="91.04" y2="80.19"/>
-  <line class="cls-1" x1="179.78" y1="147.36" x2="214.84" y2="193.66"/>
-  <circle class="cls-1" cx="98.34" cy="205.54" r="8.7"/>
-  <line class="cls-1" x1="162.38" y1="147.36" x2="104.44" y2="199.33"/>
-  <circle class="cls-1" cx="221.44" cy="199.33" r="8.7"/>
-  <circle class="cls-1" cx="192.4" cy="49.52" r="8.7"/>
-  <line class="cls-1" x1="183.7" y1="49.52" x2="173.72" y2="49.52"/>
-  <polyline class="cls-1" points="198.52 55.71 264.68 179.72 149.94 15.49"/>
-  <line class="cls-1" x1="142.11" y1="20.41" x2="171.08" y2="138.65"/>
+  <circle class="st0" cx="143.9" cy="50.7" r="8.7"/>
+  <circle class="st0" cx="13.5" cy="234" r="8.7"/>
+  <circle class="st0" cx="171.5" cy="251.4" r="8.7"/>
+  <circle class="st0" cx="272.2" cy="225.3" r="8.7"/>
+  <circle class="st0" cx="172.9" cy="186.3" r="8.7"/>
+  <circle class="st0" cx="79.6" cy="112.2" r="8.7"/>
+  <line class="st0" x1="75.3" y1="119.8" x2="17" y2="226"/>
+  <line class="st0" x1="231.4" y1="235.3" x2="263.5" y2="225.3"/>
+  <line class="st0" x1="180.2" y1="251.4" x2="214.8" y2="240.5"/>
+  <line class="st0" x1="108.8" y1="246.2" x2="162.8" y2="251.4"/>
+  <polyline class="st0" points="135.7 53.5 22.2 234 91.4 244.5"/>
+  <line class="st0" x1="87.5" y1="115.9" x2="92.8" y2="119.2"/>
+  <path class="st0" d="M181.6,186.3"/>
+  <line class="st0" x1="181.6" y1="186.3" x2="216.6" y2="232.7"/>
+  <circle class="st0" cx="100.1" cy="244.5" r="8.7"/>
+  <line class="st0" x1="164.2" y1="186.3" x2="106.2" y2="238.3"/>
+  <circle class="st0" cx="223.2" cy="238.3" r="8.7"/>
+  <circle class="st0" cx="194.2" cy="88.5" r="8.7"/>
+  <line class="st0" x1="185.5" y1="88.5" x2="175.5" y2="88.5"/>
+  <polyline class="st0" points="200.3 94.7 266.5 218.7 151.7 54.5"/>
+  <line class="st0" x1="143.9" y1="59.4" x2="172.9" y2="177.6"/>
 </svg>
