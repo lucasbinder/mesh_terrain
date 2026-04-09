@@ -7671,4 +7671,16 @@ def update_path_profile(
 
 
 if __name__ == "__main__":
-    app.run(debug=False, dev_tools_hot_reload=False, use_reloader=False)
+    debug_enabled = env_flag("DASH_DEBUG", default=False)
+    app_host = str(os.environ.get("APP_HOST", "0.0.0.0") or "0.0.0.0")
+    try:
+        app_port = int(os.environ.get("APP_PORT", "8050") or "8050")
+    except (TypeError, ValueError):
+        app_port = 8050
+    app.run(
+        host=app_host,
+        port=app_port,
+        debug=debug_enabled,
+        dev_tools_hot_reload=debug_enabled,
+        use_reloader=debug_enabled,
+    )
