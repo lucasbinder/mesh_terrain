@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${APP_RUNTIME_MODE:-production}" == "debug" ]]; then
+  exec python app.py
+fi
+
 gunicorn \
   --bind "${GUNICORN_BIND}" \
   --workers "${GUNICORN_WORKERS}" \
