@@ -98,10 +98,7 @@ DEFAULT_TX_POWER_DBM = 22.0
 DEFAULT_TX_GAIN_DBI = 5.0
 DEFAULT_RX_GAIN_DBI = 2.0
 DEFAULT_OTHER_LOSSES_DB = 3.0
-RSSI_PATH_SAMPLE_SPACING_MIN_M = 25.0
-RSSI_PATH_SAMPLE_SPACING_MAX_M = 200.0
-RSSI_PATH_SAMPLE_SPACING_STEP_M = 25.0
-DEFAULT_RSSI_PATH_SAMPLE_SPACING_M = 100.0
+DEFAULT_RSSI_PATH_SAMPLE_SPACING_M = DEFAULT_BBOX_RESOLUTION_M
 MIN_LINK_RSSI_DBM = -140.0
 VIEWSHED_ASSESSMENT_RADIUS_M = 100.0
 VIEWSHED_ASSESSMENT_OBSERVER_HEIGHT_AGL_M = 0.0
@@ -679,13 +676,7 @@ def next_revision(current_revision):
 
 
 def normalize_rssi_path_sample_spacing(sample_spacing_m):
-    if sample_spacing_m is None:
-        value = DEFAULT_RSSI_PATH_SAMPLE_SPACING_M
-    else:
-        value = float(sample_spacing_m)
-    value = min(max(value, RSSI_PATH_SAMPLE_SPACING_MIN_M), RSSI_PATH_SAMPLE_SPACING_MAX_M)
-    steps = round((value - RSSI_PATH_SAMPLE_SPACING_MIN_M) / RSSI_PATH_SAMPLE_SPACING_STEP_M)
-    return float(RSSI_PATH_SAMPLE_SPACING_MIN_M + steps * RSSI_PATH_SAMPLE_SPACING_STEP_M)
+    return normalize_bbox_resolution_m(sample_spacing_m)
 
 
 def click_mode_value(click_mode):
@@ -4912,28 +4903,7 @@ app.layout = [
                                         value=["enabled"],
                                     ),
                                     html.Div(
-                                        "RSSI path sample spacing (m)",
-                                        style={"fontWeight": "600", "marginTop": "4px"},
-                                    ),
-                                    dcc.Slider(
-                                        RSSI_PATH_SAMPLE_SPACING_MIN_M,
-                                        RSSI_PATH_SAMPLE_SPACING_MAX_M,
-                                        step=RSSI_PATH_SAMPLE_SPACING_STEP_M,
-                                        value=DEFAULT_RSSI_PATH_SAMPLE_SPACING_M,
-                                        marks={
-                                            int(value): str(int(value))
-                                            for value in np.arange(
-                                                RSSI_PATH_SAMPLE_SPACING_MIN_M,
-                                                RSSI_PATH_SAMPLE_SPACING_MAX_M + RSSI_PATH_SAMPLE_SPACING_STEP_M,
-                                                RSSI_PATH_SAMPLE_SPACING_STEP_M,
-                                            )
-                                        },
-                                        id="rssi-path-sample-spacing-m",
-                                        updatemode="mouseup",
-                                        disabled=True,
-                                    ),
-                                    html.Div(
-                                        "Lower spacing increases path-trace density and runtime. 100 m matches the previous default.",
+                                        "Ground-loss path sampling now follows the current bbox resolution setting.",
                                         style={"fontSize": "12px", "color": "#cbd5e1"},
                                     ),
                                 ],
@@ -5273,15 +5243,6 @@ def update_locked_control_state(terrain_ready):
         disabled,
         disabled,
     )
-
-
-@app.callback(
-    Output("rssi-path-sample-spacing-m", "disabled"),
-    Input("terrain-ready-store", "data"),
-    Input("include-rssi-ground-loss", "value"),
-)
-def update_rssi_path_sample_spacing_disabled(terrain_ready, include_rssi_ground_loss):
-    return (not bool(terrain_ready)) or ("enabled" not in (include_rssi_ground_loss or []))
 
 
 @app.callback(
@@ -6518,7 +6479,6 @@ def update_node_summary(nodes, selected_node_ids, _calculation_store, overlay_se
     State("global-rx-height-agl", "value"),
     State("global-rx-gain-dbi", "value"),
     State("include-rssi-ground-loss", "value"),
-    State("rssi-path-sample-spacing-m", "value"),
     prevent_initial_call=True,
 )
 def generate_rssi_overlay(
@@ -6530,7 +6490,6 @@ def generate_rssi_overlay(
     global_rx_height_agl,
     global_rx_gain_dbi,
     include_rssi_ground_loss,
-    rssi_path_sample_spacing_m,
 ):
     if not run_request:
         raise PreventUpdate
@@ -6569,7 +6528,7 @@ def generate_rssi_overlay(
     include_ground_loss = "enabled" in (include_rssi_ground_loss or [])
     rx_height = global_rx_height_agl or DEFAULT_GLOBAL_RX_HEIGHT_M
     rx_gain = global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI
-    sample_spacing_m = normalize_rssi_path_sample_spacing(rssi_path_sample_spacing_m)
+    sample_spacing_m = normalize_rssi_path_sample_spacing(bbox_resolution_m)
     node_overlay_keys = {}
     node_signatures = {}
     started_at = time.perf_counter()
