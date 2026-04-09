@@ -92,6 +92,7 @@ DEFAULT_BBOX = {
 
 DISPLAY_MAX_DIM = 2400
 DISPLAY_MIN_DIM = 512
+ELEVATION_EXPORT_MAX_REQUEST_DIM = 2048
 MIN_BBOX_RESOLUTION_M = 50.0
 MAX_BBOX_RESOLUTION_M = 200.0
 DEFAULT_BBOX_RESOLUTION_M = 100.0
@@ -1011,7 +1012,15 @@ def fetch_elevation_raster_mosaic(min_x, min_y, max_x, max_y, crs, width, height
     full_transform = rasterio.transform.from_bounds(float(min_x), float(min_y), float(max_x), float(max_y), width, height)
     mosaic = np.full((height, width), np.nan, dtype=np.float32)
 
-    for spec in raster_request_specs(min_x, min_y, max_x, max_y, width, height):
+    for spec in raster_request_specs(
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+        width,
+        height,
+        max_request_dim=ELEVATION_EXPORT_MAX_REQUEST_DIM,
+    ):
         raster_bytes = fetch_elevation_raster_bytes(
             spec["min_x"],
             spec["min_y"],
@@ -2333,7 +2342,7 @@ def get_viewshed_assessment_terrain(longitude, latitude, radius_m):
         VIEWSHED_ASSESSMENT_MAX_DIM,
     )
 
-    terrain_href = elevation_export_image_href(
+    terrain_bytes = fetch_elevation_raster_bytes(
         min_x,
         min_y,
         max_x,
@@ -2342,11 +2351,12 @@ def get_viewshed_assessment_terrain(longitude, latitude, radius_m):
         projected_dim,
         projected_dim,
     )
-    with open_remote_raster(terrain_href) as src:
-        terrain_values = src.read(1).astype(np.float32)
-        projected_transform = rasterio.transform.from_bounds(min_x, min_y, max_x, max_y, src.width, src.height)
-        terrain_x_axis, terrain_y_axis = raster_axes(projected_transform, src.height, src.width)
-        projected_shape = (src.height, src.width)
+    with MemoryFile(terrain_bytes) as memfile:
+        with memfile.open() as src:
+            terrain_values = src.read(1).astype(np.float32)
+            projected_transform = rasterio.transform.from_bounds(min_x, min_y, max_x, max_y, src.width, src.height)
+            terrain_x_axis, terrain_y_axis = raster_axes(projected_transform, src.height, src.width)
+            projected_shape = (src.height, src.width)
 
     display_min_lon, display_min_lat, display_max_lon, display_max_lat = transform_bounds(
         PROJECTED_CRS,
