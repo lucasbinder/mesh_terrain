@@ -80,6 +80,7 @@ OSM_TILE_HEADERS = {"User-Agent": "NF-MTP/1.0"}
 REMOTE_FETCH_HEADERS = {
     "User-Agent": "NF-MTP/1.0",
     "Accept": "*/*",
+    "Referer": "https://elevation.nationalmap.gov/",
 }
 
 DEFAULT_BBOX = {
@@ -970,8 +971,11 @@ def span_to_sample_dim(span_m, target_resolution_m, min_dim, max_dim):
     return int(np.clip(sample_dim, int(min_dim), int(max_dim)))
 
 
-def elevation_export_image_href(min_x, min_y, max_x, max_y, crs, width, height):
-    meta_url = (
+def elevation_export_image_url(min_x, min_y, max_x, max_y, crs, width, height, response_format="image"):
+    response_format = str(response_format or "image").strip().lower()
+    if response_format not in {"image", "json"}:
+        response_format = "image"
+    return (
         "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
         f"?bbox={float(min_x)},{float(min_y)},{float(max_x)},{float(max_y)}"
         f"&bboxSR={str(crs).split(':')[-1]}"
@@ -980,9 +984,25 @@ def elevation_export_image_href(min_x, min_y, max_x, max_y, crs, width, height):
         "&format=tiff"
         "&pixelType=F32"
         "&interpolation=RSP_BilinearInterpolation"
-        "&f=json"
+        f"&f={response_format}"
     )
-    return fetch_image_href(meta_url)
+
+
+def fetch_elevation_raster_bytes(min_x, min_y, max_x, max_y, crs, width, height):
+    direct_url = elevation_export_image_url(min_x, min_y, max_x, max_y, crs, width, height, response_format="image")
+    try:
+        return fetch_binary_with_headers(direct_url, timeout=240)
+    except requests.HTTPError as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code not in {400, 401, 403, 404, 405}:
+            raise
+        LOGGER.warning(
+            "Direct elevation export failed with status=%s; falling back to export metadata flow.",
+            status_code,
+        )
+    meta_url = elevation_export_image_url(min_x, min_y, max_x, max_y, crs, width, height, response_format="json")
+    href = fetch_image_href(meta_url)
+    return fetch_binary_with_headers(href, timeout=240)
 
 
 def fetch_elevation_raster_mosaic(min_x, min_y, max_x, max_y, crs, width, height):
@@ -992,7 +1012,7 @@ def fetch_elevation_raster_mosaic(min_x, min_y, max_x, max_y, crs, width, height
     mosaic = np.full((height, width), np.nan, dtype=np.float32)
 
     for spec in raster_request_specs(min_x, min_y, max_x, max_y, width, height):
-        href = elevation_export_image_href(
+        raster_bytes = fetch_elevation_raster_bytes(
             spec["min_x"],
             spec["min_y"],
             spec["max_x"],
@@ -1001,37 +1021,38 @@ def fetch_elevation_raster_mosaic(min_x, min_y, max_x, max_y, crs, width, height
             spec["width"],
             spec["height"],
         )
-        with open_remote_raster(href) as src:
-            source = src.read(1).astype(np.float32)
-            src_transform = rasterio.transform.from_bounds(
-                spec["min_x"],
-                spec["min_y"],
-                spec["max_x"],
-                spec["max_y"],
-                src.width,
-                src.height,
-            )
-            window = rasterio.windows.Window(
-                col_off=spec["col_offset"],
-                row_off=spec["row_offset"],
-                width=spec["width"],
-                height=spec["height"],
-            )
-            destination = mosaic[
-                spec["row_offset"]:spec["row_offset"] + spec["height"],
-                spec["col_offset"]:spec["col_offset"] + spec["width"],
-            ]
-            safe_reproject(
-                source=source,
-                destination=destination,
-                src_transform=src_transform,
-                src_crs=crs,
-                src_nodata=np.nan,
-                dst_transform=rasterio.windows.transform(window, full_transform),
-                dst_crs=crs,
-                dst_nodata=np.nan,
-                resampling=Resampling.bilinear,
-            )
+        with MemoryFile(raster_bytes) as memfile:
+            with memfile.open() as src:
+                source = src.read(1).astype(np.float32)
+                src_transform = rasterio.transform.from_bounds(
+                    spec["min_x"],
+                    spec["min_y"],
+                    spec["max_x"],
+                    spec["max_y"],
+                    src.width,
+                    src.height,
+                )
+                window = rasterio.windows.Window(
+                    col_off=spec["col_offset"],
+                    row_off=spec["row_offset"],
+                    width=spec["width"],
+                    height=spec["height"],
+                )
+                destination = mosaic[
+                    spec["row_offset"]:spec["row_offset"] + spec["height"],
+                    spec["col_offset"]:spec["col_offset"] + spec["width"],
+                ]
+                safe_reproject(
+                    source=source,
+                    destination=destination,
+                    src_transform=src_transform,
+                    src_crs=crs,
+                    src_nodata=np.nan,
+                    dst_transform=rasterio.windows.transform(window, full_transform),
+                    dst_crs=crs,
+                    dst_nodata=np.nan,
+                    resampling=Resampling.bilinear,
+                )
 
     return mosaic
 
