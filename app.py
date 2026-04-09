@@ -1006,30 +1006,48 @@ def elevation_wcs_coverage_url(min_x, min_y, max_x, max_y, crs, width, height):
     )
 
 
+def summarize_remote_fetch_error(label, url, exc):
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code is not None:
+            return f"{label}: HTTP {status_code} for {url}"
+    return f"{label}: {exc.__class__.__name__} for {url}: {exc}"
+
+
 def fetch_elevation_raster_bytes(min_x, min_y, max_x, max_y, crs, width, height):
+    errors = []
     direct_url = elevation_export_image_url(min_x, min_y, max_x, max_y, crs, width, height, response_format="image")
     try:
         return fetch_binary_with_headers(direct_url, timeout=240)
     except requests.HTTPError as exc:
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        errors.append(summarize_remote_fetch_error("exportImage f=image", direct_url, exc))
         if status_code not in {400, 401, 403, 404, 405}:
             raise
         LOGGER.warning(
             "Direct elevation export failed with status=%s; trying WCS fallback.",
             status_code,
         )
-    except Exception:
+    except Exception as exc:
+        errors.append(summarize_remote_fetch_error("exportImage f=image", direct_url, exc))
         LOGGER.exception("Direct elevation export failed unexpectedly; trying WCS fallback.")
 
     wcs_url = elevation_wcs_coverage_url(min_x, min_y, max_x, max_y, crs, width, height)
     try:
         return fetch_binary_with_headers(wcs_url, timeout=240)
-    except Exception:
+    except Exception as exc:
+        errors.append(summarize_remote_fetch_error("WCS GetCoverage", wcs_url, exc))
         LOGGER.exception("WCS elevation fallback failed for %s", wcs_url)
 
     meta_url = elevation_export_image_url(min_x, min_y, max_x, max_y, crs, width, height, response_format="json")
-    href = fetch_image_href(meta_url)
-    return fetch_binary_with_headers(href, timeout=240)
+    try:
+        href = fetch_image_href(meta_url)
+        return fetch_binary_with_headers(href, timeout=240)
+    except Exception as exc:
+        errors.append(summarize_remote_fetch_error("exportImage f=json", meta_url, exc))
+        message = "Elevation fetch failed. " + " | ".join(errors)
+        raise RuntimeError(message) from exc
 
 
 def fetch_elevation_raster_mosaic(min_x, min_y, max_x, max_y, crs, width, height):
