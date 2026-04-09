@@ -71,6 +71,7 @@ WEB_MERCATOR_CRS = "EPSG:3857"
 WORLDCOVER_BASE_URL = "https://esa-worldcover.s3.eu-central-1.amazonaws.com"
 WORLDCOVER_VERSION = "v200"
 WORLDCOVER_YEAR = "2021"
+ELEVATION_WCS_URL = "https://elevation.nationalmap.gov/arcgis/services/3DEPElevation/ImageServer/WCSServer"
 OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 OSM_TILE_SIZE = 256
 OSM_MIN_ZOOM = 2
@@ -989,6 +990,22 @@ def elevation_export_image_url(min_x, min_y, max_x, max_y, crs, width, height, r
     )
 
 
+def elevation_wcs_coverage_url(min_x, min_y, max_x, max_y, crs, width, height):
+    return (
+        f"{ELEVATION_WCS_URL}"
+        "?SERVICE=WCS"
+        "&VERSION=1.0.0"
+        "&REQUEST=GetCoverage"
+        "&COVERAGE=1"
+        "&FORMAT=GeoTIFF"
+        f"&BBOX={float(min_x)},{float(min_y)},{float(max_x)},{float(max_y)}"
+        f"&WIDTH={int(width)}"
+        f"&HEIGHT={int(height)}"
+        f"&CRS={str(crs)}"
+        "&INTERPOLATION=bilinear"
+    )
+
+
 def fetch_elevation_raster_bytes(min_x, min_y, max_x, max_y, crs, width, height):
     direct_url = elevation_export_image_url(min_x, min_y, max_x, max_y, crs, width, height, response_format="image")
     try:
@@ -998,9 +1015,18 @@ def fetch_elevation_raster_bytes(min_x, min_y, max_x, max_y, crs, width, height)
         if status_code not in {400, 401, 403, 404, 405}:
             raise
         LOGGER.warning(
-            "Direct elevation export failed with status=%s; falling back to export metadata flow.",
+            "Direct elevation export failed with status=%s; trying WCS fallback.",
             status_code,
         )
+    except Exception:
+        LOGGER.exception("Direct elevation export failed unexpectedly; trying WCS fallback.")
+
+    wcs_url = elevation_wcs_coverage_url(min_x, min_y, max_x, max_y, crs, width, height)
+    try:
+        return fetch_binary_with_headers(wcs_url, timeout=240)
+    except Exception:
+        LOGGER.exception("WCS elevation fallback failed for %s", wcs_url)
+
     meta_url = elevation_export_image_url(min_x, min_y, max_x, max_y, crs, width, height, response_format="json")
     href = fetch_image_href(meta_url)
     return fetch_binary_with_headers(href, timeout=240)
