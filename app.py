@@ -7,10 +7,11 @@ import json
 import logging
 import math
 import os
+import tempfile
 import threading
 import time
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from itertools import combinations
 
@@ -21,6 +22,8 @@ import rasterio
 import requests
 import xarray as xr
 import dask
+import dask.array as da
+from dask.callbacks import Callback
 from PIL import Image, ImageColor
 from dash import ALL, ClientsideFunction, Dash, Input, Output, State, ctx, dcc, html, no_update
 from dash.exceptions import PreventUpdate
@@ -38,8 +41,21 @@ from scipy.interpolate import RBFInterpolator
 try:
     from tqdm import tqdm
 except ModuleNotFoundError:
+    class _NullTqdm:
+        def __init__(self, iterable=None, **_kwargs):
+            self.iterable = iterable
+
+        def __iter__(self):
+            return iter(self.iterable or [])
+
+        def update(self, _n=1):
+            return None
+
+        def close(self):
+            return None
+
     def tqdm(iterable=None, **_kwargs):
-        return iterable
+        return _NullTqdm(iterable=iterable, **_kwargs)
 from xrspatial import viewshed
 
 try:
@@ -69,6 +85,12 @@ DEFAULT_BBOX = {
 
 DISPLAY_MAX_DIM = 2400
 DISPLAY_MIN_DIM = 512
+MIN_BBOX_RESOLUTION_M = 50.0
+MAX_BBOX_RESOLUTION_M = 200.0
+DEFAULT_BBOX_RESOLUTION_M = 100.0
+BBOX_RESOLUTION_STEP_M = 25.0
+DASK_STREAM_MEMMAP_MIN_BYTES = 16 * 1024 * 1024
+DASK_STREAM_MEMMAP_DIR = os.path.join(tempfile.gettempdir(), "mesh_terrain_dask_memmaps")
 DEFAULT_NODE_HEIGHT_M = 2.0
 DEFAULT_GLOBAL_RX_HEIGHT_M = 2.0
 DEFAULT_FREQ_MHZ = 915.0
@@ -233,6 +255,8 @@ def V_ATTENUATION(values):
 ANALYSIS_CONTEXT = {}
 ANALYSIS_KEY = None
 RSSI_OVERLAY_CACHE = {}
+RSSI_PROGRESS_STATE = {}
+RSSI_PROGRESS_LOCK = threading.Lock()
 VIEWSHED_ASSESSMENT_CACHE = {}
 TERRAIN_DEM_TOKENS = {}
 DESKTOP_NOTIFIER = DesktopNotifier(app_name="Mesh Terrain") if DesktopNotifier is not None else None
@@ -346,8 +370,32 @@ def normalized_context_bbox(bbox_data):
     }
 
 
+def normalize_bbox_resolution_m(resolution_m):
+    if resolution_m is None:
+        resolution_m = DEFAULT_BBOX_RESOLUTION_M
+    try:
+        resolution_m = float(resolution_m)
+    except (TypeError, ValueError):
+        resolution_m = DEFAULT_BBOX_RESOLUTION_M
+    if not np.isfinite(resolution_m):
+        resolution_m = DEFAULT_BBOX_RESOLUTION_M
+    return float(np.clip(resolution_m, MIN_BBOX_RESOLUTION_M, MAX_BBOX_RESOLUTION_M))
+
+
+def bundle_cache_key(min_lon, min_lat, max_lon, max_lat, target_resolution_m=DEFAULT_BBOX_RESOLUTION_M):
+    min_lon, min_lat, max_lon, max_lat = normalize_bbox(min_lon, min_lat, max_lon, max_lat)
+    return (
+        float(min_lon),
+        float(min_lat),
+        float(max_lon),
+        float(max_lat),
+        normalize_bbox_resolution_m(target_resolution_m),
+    )
+
+
 def native_map_visual_context_key(
     bbox_data,
+    bbox_resolution_m,
     terrain_alpha,
     terrain_clip_range,
     worldcover_display,
@@ -363,6 +411,7 @@ def native_map_visual_context_key(
 ):
     payload = {
         "bbox": normalized_context_bbox(bbox_data),
+        "bbox_resolution_m": normalize_visual_context_value(normalize_bbox_resolution_m(bbox_resolution_m)),
         "terrain_alpha": normalize_visual_context_value(terrain_alpha),
         "terrain_clip_range": normalize_visual_context_value(terrain_clip_range),
         "worldcover_enabled": "enabled" in (worldcover_display or []),
@@ -417,13 +466,34 @@ def safe_reproject(**kwargs):
         reproject(**kwargs)
 
 
-def materialize_data_array_values(data_array, dtype=None):
+def ensure_dask_stream_memmap_dir():
+    os.makedirs(DASK_STREAM_MEMMAP_DIR, exist_ok=True)
+    return DASK_STREAM_MEMMAP_DIR
+
+
+def data_array_memmap_path(bundle, key, dtype):
+    dtype = np.dtype(dtype)
+    token = hashlib.sha1(
+        repr((bundle.get("cache_key"), str(key), dtype.str)).encode("utf-8")
+    ).hexdigest()
+    return os.path.join(ensure_dask_stream_memmap_dir(), f"{token}.dat")
+
+
+def materialize_data_array_values(data_array, dtype=None, memmap_path=None):
     data = data_array.data
+    target_dtype = np.dtype(dtype or data_array.dtype)
     if dask.is_dask_collection(data):
-        data = data.compute()
+        shape = tuple(int(size) for size in data_array.shape)
+        nbytes = int(np.prod(shape, dtype=np.int64)) * int(target_dtype.itemsize)
+        if memmap_path and nbytes >= int(DASK_STREAM_MEMMAP_MIN_BYTES):
+            array = np.memmap(memmap_path, mode="w+", dtype=target_dtype, shape=shape)
+            da.store(da.asarray(data).astype(target_dtype, copy=False), array, lock=False, compute=True)
+            array.flush()
+            return array
+        data = da.asarray(data).astype(target_dtype, copy=False).compute()
     array = np.asarray(data)
-    if dtype is not None:
-        array = array.astype(dtype, copy=False)
+    if array.dtype != target_dtype:
+        array = array.astype(target_dtype, copy=False)
     return array
 
 
@@ -433,7 +503,11 @@ def cached_bundle_data_array_values(bundle, key, dtype=None):
     if cached is not None:
         if dtype is None or cached.dtype == np.dtype(dtype):
             return cached
-    values = materialize_data_array_values(bundle[key], dtype=dtype)
+    memmap_path = None
+    if dask.is_dask_collection(bundle[key].data):
+        memmap_path = data_array_memmap_path(bundle, key, dtype or bundle[key].dtype)
+        bundle[f"{key}_values_memmap_path"] = memmap_path
+    values = materialize_data_array_values(bundle[key], dtype=dtype, memmap_path=memmap_path)
     bundle[cache_key] = values
     return values
 
@@ -715,23 +789,9 @@ def geographic_bbox_to_pixel_shape(min_lon, min_lat, max_lon, max_lat, max_dim=D
     return extent_to_pixel_shape(min_lon, min_lat, max_lon, max_lat, max_dim=max_dim, min_dim=min_dim)
 
 
-@lru_cache(maxsize=1)
-def default_geographic_pixel_size():
-    min_lon, min_lat, max_lon, max_lat = normalize_bbox(
-        DEFAULT_BBOX["min_lon"],
-        DEFAULT_BBOX["min_lat"],
-        DEFAULT_BBOX["max_lon"],
-        DEFAULT_BBOX["max_lat"],
-    )
-    width, height = geographic_bbox_to_pixel_shape(min_lon, min_lat, max_lon, max_lat)
-    return (
-        max((max_lon - min_lon) / max(width, 1), 1e-9),
-        max((max_lat - min_lat) / max(height, 1), 1e-9),
-    )
-
-
-@lru_cache(maxsize=1)
-def default_projected_pixel_size():
+@lru_cache(maxsize=16)
+def default_geographic_pixel_size(target_projected_pixel_size_m=DEFAULT_BBOX_RESOLUTION_M):
+    target_projected_pixel_size_m = normalize_bbox_resolution_m(target_projected_pixel_size_m)
     min_lon, min_lat, max_lon, max_lat = normalize_bbox(
         DEFAULT_BBOX["min_lon"],
         DEFAULT_BBOX["min_lat"],
@@ -746,7 +806,37 @@ def default_projected_pixel_size():
         max_lon,
         max_lat,
     )
-    width, height = extent_to_pixel_shape(min_x, min_y, max_x, max_y)
+    x_span_m = max((max_x - min_x), 1e-6)
+    y_span_m = max((max_y - min_y), 1e-6)
+    width = max(int(math.ceil(x_span_m / target_projected_pixel_size_m)), 1)
+    height = max(int(math.ceil(y_span_m / target_projected_pixel_size_m)), 1)
+    return (
+        max((max_lon - min_lon) / max(width, 1), 1e-9),
+        max((max_lat - min_lat) / max(height, 1), 1e-9),
+    )
+
+
+@lru_cache(maxsize=16)
+def default_projected_pixel_size(target_projected_pixel_size_m=DEFAULT_BBOX_RESOLUTION_M):
+    target_projected_pixel_size_m = normalize_bbox_resolution_m(target_projected_pixel_size_m)
+    min_lon, min_lat, max_lon, max_lat = normalize_bbox(
+        DEFAULT_BBOX["min_lon"],
+        DEFAULT_BBOX["min_lat"],
+        DEFAULT_BBOX["max_lon"],
+        DEFAULT_BBOX["max_lat"],
+    )
+    min_x, min_y, max_x, max_y = transform_bounds(
+        GEOGRAPHIC_CRS,
+        PROJECTED_CRS,
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+    )
+    x_span_m = max((max_x - min_x), 1e-6)
+    y_span_m = max((max_y - min_y), 1e-6)
+    width = max(int(math.ceil(x_span_m / target_projected_pixel_size_m)), 1)
+    height = max(int(math.ceil(y_span_m / target_projected_pixel_size_m)), 1)
     return (
         max((max_x - min_x) / max(width, 1), 1e-6),
         max((max_y - min_y) / max(height, 1), 1e-6),
@@ -754,13 +844,38 @@ def default_projected_pixel_size():
 
 
 def target_pixel_shape_for_extent(min_x, min_y, max_x, max_y, pixel_size, max_dim=DISPLAY_MAX_DIM, min_dim=DISPLAY_MIN_DIM):
-    bounded_width, bounded_height = extent_to_pixel_shape(min_x, min_y, max_x, max_y, max_dim=max_dim, min_dim=min_dim)
     x_span = max(float(max_x) - float(min_x), 1e-9)
     y_span = max(float(max_y) - float(min_y), 1e-9)
     pixel_size_x, pixel_size_y = pixel_size
-    width = max(int(bounded_width), int(math.ceil(x_span / max(float(pixel_size_x), 1e-9))))
-    height = max(int(bounded_height), int(math.ceil(y_span / max(float(pixel_size_y), 1e-9))))
+    width = int(math.ceil(x_span / max(float(pixel_size_x), 1e-9)))
+    height = int(math.ceil(y_span / max(float(pixel_size_y), 1e-9)))
     return max(width, 1), max(height, 1)
+
+
+def mercator_axes_to_geographic(x_axis, y_axis):
+    x_axis = np.asarray(x_axis, dtype=np.float64)
+    y_axis = np.asarray(y_axis, dtype=np.float64)
+    if x_axis.size:
+        lon_axis, _ = transform(
+            WEB_MERCATOR_CRS,
+            GEOGRAPHIC_CRS,
+            x_axis.tolist(),
+            [0.0] * int(x_axis.size),
+        )
+        lon_axis = np.asarray(lon_axis, dtype=np.float64)
+    else:
+        lon_axis = np.empty(0, dtype=np.float64)
+    if y_axis.size:
+        _, lat_axis = transform(
+            WEB_MERCATOR_CRS,
+            GEOGRAPHIC_CRS,
+            [0.0] * int(y_axis.size),
+            y_axis.tolist(),
+        )
+        lat_axis = np.asarray(lat_axis, dtype=np.float64)
+    else:
+        lat_axis = np.empty(0, dtype=np.float64)
+    return lon_axis, lat_axis
 
 
 def split_dimension(total, max_chunk):
@@ -1624,7 +1739,7 @@ def build_native_map_spec(
         overlay_mode = str(rssi_overlay.get("mode") or "max-rssi")
         if overlay_mode == "best-node":
             rssi_uri = colorize_category_array_to_png_uri(
-                np.flipud(rssi_overlay["owner_index"]),
+                rssi_overlay["owner_index"],
                 [item["color"] for item in rssi_overlay.get("legend_items", [])],
                 alpha=float(rssi_opacity or 0.0),
             )
@@ -1638,7 +1753,7 @@ def build_native_map_spec(
             }
         else:
             rssi_uri = colorize_array_to_png_uri(
-                np.flipud(rssi_overlay["max_rssi"]),
+                rssi_overlay["max_rssi"],
                 rssi_colorscale,
                 -140.0,
                 -60.0,
@@ -1966,7 +2081,8 @@ def ranges_from_relayout_data(relayout_data, fallback_x_range, fallback_y_range)
 
 
 @lru_cache(maxsize=4)
-def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
+def _get_map_bundle_cached(min_lon, min_lat, max_lon, max_lat, target_resolution_m):
+    target_resolution_m = normalize_bbox_resolution_m(target_resolution_m)
     min_x, min_y, max_x, max_y = transform_bounds(
         GEOGRAPHIC_CRS,
         PROJECTED_CRS,
@@ -1980,14 +2096,14 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
         min_lat,
         max_lon,
         max_lat,
-        default_geographic_pixel_size(),
+        default_geographic_pixel_size(target_resolution_m),
     )
     projected_width, projected_height = target_pixel_shape_for_extent(
         min_x,
         min_y,
         max_x,
         max_y,
-        default_projected_pixel_size(),
+        default_projected_pixel_size(target_resolution_m),
     )
 
     terrain_display = fetch_elevation_raster_mosaic(
@@ -2008,6 +2124,34 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
         "max_lon": float(max_lon),
         "max_lat": float(max_lat),
     }
+    map_min_x, map_min_y, map_max_x, map_max_y = transform_bounds(
+        GEOGRAPHIC_CRS,
+        WEB_MERCATOR_CRS,
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+    )
+    map_display_width = max(int(math.ceil((map_max_x - map_min_x) / max(float(target_resolution_m), 1e-9))), 1)
+    map_display_height = max(int(math.ceil((map_max_y - map_min_y) / max(float(target_resolution_m), 1e-9))), 1)
+    map_display_transform = rasterio.transform.from_bounds(
+        map_min_x,
+        map_min_y,
+        map_max_x,
+        map_max_y,
+        map_display_width,
+        map_display_height,
+    )
+    map_display_x_axis, map_display_y_axis = raster_axes(
+        map_display_transform,
+        map_display_height,
+        map_display_width,
+    )
+    map_display_lon_axis, map_display_lat_axis = mercator_axes_to_geographic(
+        map_display_x_axis,
+        map_display_y_axis,
+    )
+    map_display_shape = (map_display_height, map_display_width)
 
     terrain_band = fetch_elevation_raster_mosaic(
         min_x,
@@ -2069,19 +2213,24 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
     ).chunk({'x': 1024, 'y': 1024}).sortby("y", ascending=False)
 
     return {
-        "cache_key": (min_lon, min_lat, max_lon, max_lat),
+        "cache_key": (min_lon, min_lat, max_lon, max_lat, target_resolution_m),
         "bbox": {
             "min_lon": min_lon,
             "min_lat": min_lat,
             "max_lon": max_lon,
             "max_lat": max_lat,
         },
+        "target_resolution_m": float(target_resolution_m),
         "terrain_display": terrain_display,
         "terrain_display_lon_axis": terrain_display_lon_axis.astype(np.float64),
         "terrain_display_lat_axis": terrain_display_lat_axis.astype(np.float64),
         "terrain_display_transform": terrain_display_transform,
         "terrain_display_shape": terrain_display_shape,
         "terrain_display_bounds": terrain_display_bounds,
+        "map_display_transform": map_display_transform,
+        "map_display_shape": map_display_shape,
+        "map_display_lon_axis": map_display_lon_axis.astype(np.float64),
+        "map_display_lat_axis": map_display_lat_axis.astype(np.float64),
         "terrain_fill_value": terrain_fill_value,
         "terrain_projected": terrain_projected,
         "worldcover_display": worldcover_display,
@@ -2089,6 +2238,13 @@ def get_map_bundle(min_lon, min_lat, max_lon, max_lat):
         "projected_transform": projected_transform,
         "projected_shape": projected_shape,
     }
+
+
+def get_map_bundle(min_lon, min_lat, max_lon, max_lat, target_resolution_m=DEFAULT_BBOX_RESOLUTION_M):
+    return _get_map_bundle_cached(*bundle_cache_key(min_lon, min_lat, max_lon, max_lat, target_resolution_m))
+
+
+get_map_bundle.cache_clear = _get_map_bundle_cached.cache_clear
 
 
 @lru_cache(maxsize=128)
@@ -2298,7 +2454,7 @@ def _lookup_value(lookup, raw_value):
 
 
 @maybe_njit(cache=False)
-def _path_loss_only_by_index(
+def _path_profile_metrics_by_index(
     terrain_values,
     worldcover_values,
     terrain_x,
@@ -2366,6 +2522,7 @@ def _path_loss_only_by_index(
     prev_x = x1
     prev_y = y1
     path_loss_db = 0.0
+    direct_los_blocked = False
 
     for sample_index in range(sample_count):
         row = _rounded_path_index(row1, row2, sample_index, sample_count)
@@ -2412,11 +2569,51 @@ def _path_loss_only_by_index(
         if sample_index == 0 or sample_index == sample_count - 1:
             blockage_fraction = 0.0
             terrain_only_blocked = False
+        elif terrain_only_blocked:
+            direct_los_blocked = True
 
         path_loss_db += _lookup_value(attenuation_lookup, worldcover_class) * blockage_fraction * sample_weight
         if terrain_only_blocked:
             path_loss_db += 20.0 * sample_weight
 
+    return path_loss_db, direct_los_blocked
+
+
+@maybe_njit(cache=False)
+def _path_loss_only_by_index(
+    terrain_values,
+    worldcover_values,
+    terrain_x,
+    terrain_y,
+    row1,
+    col1,
+    row2,
+    col2,
+    observer_height,
+    target_height,
+    min_samples,
+    sample_spacing_m,
+    legacy_sample_spacing_m,
+    offset_lookup,
+    attenuation_lookup,
+):
+    path_loss_db, _direct_los_blocked = _path_profile_metrics_by_index(
+        terrain_values,
+        worldcover_values,
+        terrain_x,
+        terrain_y,
+        row1,
+        col1,
+        row2,
+        col2,
+        observer_height,
+        target_height,
+        min_samples,
+        sample_spacing_m,
+        legacy_sample_spacing_m,
+        offset_lookup,
+        attenuation_lookup,
+    )
     return path_loss_db
 
 
@@ -2460,6 +2657,49 @@ def _compute_ground_loss_batch_numba(
     return losses
 
 
+@maybe_njit(parallel=True, cache=False)
+def _compute_ground_loss_visibility_batch_numba(
+    terrain_values,
+    worldcover_values,
+    terrain_x,
+    terrain_y,
+    observer_row,
+    observer_col,
+    target_rows,
+    target_cols,
+    observer_height,
+    target_height,
+    min_samples,
+    sample_spacing_m,
+    legacy_sample_spacing_m,
+    offset_lookup,
+    attenuation_lookup,
+):
+    losses = np.empty(target_rows.shape[0], dtype=np.float32)
+    visible = np.empty(target_rows.shape[0], dtype=np.bool_)
+    for index in prange(target_rows.shape[0]):
+        loss_db, direct_los_blocked = _path_profile_metrics_by_index(
+            terrain_values,
+            worldcover_values,
+            terrain_x,
+            terrain_y,
+            int(observer_row),
+            int(observer_col),
+            int(target_rows[index]),
+            int(target_cols[index]),
+            observer_height,
+            target_height,
+            min_samples,
+            sample_spacing_m,
+            legacy_sample_spacing_m,
+            offset_lookup,
+            attenuation_lookup,
+        )
+        losses[index] = loss_db
+        visible[index] = not direct_los_blocked
+    return losses, visible
+
+
 @maybe_njit(cache=False)
 def _compute_ground_loss_batch_numba_serial(
     terrain_values,
@@ -2498,6 +2738,49 @@ def _compute_ground_loss_batch_numba_serial(
             attenuation_lookup,
         )
     return losses
+
+
+@maybe_njit(cache=False)
+def _compute_ground_loss_visibility_batch_numba_serial(
+    terrain_values,
+    worldcover_values,
+    terrain_x,
+    terrain_y,
+    observer_row,
+    observer_col,
+    target_rows,
+    target_cols,
+    observer_height,
+    target_height,
+    min_samples,
+    sample_spacing_m,
+    legacy_sample_spacing_m,
+    offset_lookup,
+    attenuation_lookup,
+):
+    losses = np.empty(target_rows.shape[0], dtype=np.float32)
+    visible = np.empty(target_rows.shape[0], dtype=np.bool_)
+    for index in range(target_rows.shape[0]):
+        loss_db, direct_los_blocked = _path_profile_metrics_by_index(
+            terrain_values,
+            worldcover_values,
+            terrain_x,
+            terrain_y,
+            int(observer_row),
+            int(observer_col),
+            int(target_rows[index]),
+            int(target_cols[index]),
+            observer_height,
+            target_height,
+            min_samples,
+            sample_spacing_m,
+            legacy_sample_spacing_m,
+            offset_lookup,
+            attenuation_lookup,
+        )
+        losses[index] = loss_db
+        visible[index] = not direct_los_blocked
+    return losses, visible
 
 
 def normalize_target_indices(target_rows_or_cells, target_cols=None):
@@ -2683,6 +2966,50 @@ def compute_ground_loss_for_chunk(args, use_parallel_numba=True):
         ATTENUATION_LOOKUP,
     )
     return rows, cols, np.asarray(losses, dtype=np.float32)
+
+
+def compute_ground_loss_visibility_for_chunk(args, use_parallel_numba=True):
+    if len(args) == 5:
+        observer_row, observer_col, cells, observer_height, target_height = args
+        rows, cols = normalize_target_indices(cells)
+        sample_spacing_m = DEFAULT_RSSI_PATH_SAMPLE_SPACING_M
+    elif len(args) == 6:
+        observer_row, observer_col, rows, cols, observer_height, target_height = args
+        sample_spacing_m = DEFAULT_RSSI_PATH_SAMPLE_SPACING_M
+        rows, cols = normalize_target_indices(rows, cols)
+    elif len(args) == 7:
+        observer_row, observer_col, rows, cols, observer_height, target_height, sample_spacing_m = args
+        rows, cols = normalize_target_indices(rows, cols)
+    else:
+        raise ValueError("Expected 5, 6, or 7 arguments for compute_ground_loss_visibility_for_chunk.")
+
+    if rows.size == 0:
+        return rows, cols, np.empty(0, dtype=np.float32), np.empty(0, dtype=bool)
+    sample_spacing_m = normalize_rssi_path_sample_spacing(sample_spacing_m)
+
+    compute_fn = (
+        _compute_ground_loss_visibility_batch_numba
+        if use_parallel_numba
+        else _compute_ground_loss_visibility_batch_numba_serial
+    )
+    losses, visible = compute_fn(
+        ANALYSIS_CONTEXT["terrain_values"],
+        ANALYSIS_CONTEXT["worldcover_values"],
+        ANALYSIS_CONTEXT["terrain_x"],
+        ANALYSIS_CONTEXT["terrain_y"],
+        int(observer_row),
+        int(observer_col),
+        rows,
+        cols,
+        float(observer_height),
+        float(target_height),
+        2,
+        float(sample_spacing_m),
+        float(DEFAULT_RSSI_PATH_SAMPLE_SPACING_M),
+        OFFSET_LOOKUP,
+        ATTENUATION_LOOKUP,
+    )
+    return rows, cols, np.asarray(losses, dtype=np.float32), np.asarray(visible, dtype=bool)
 
 
 def fspl_db(distance_km, freq_mhz):
@@ -2955,27 +3282,73 @@ def rssi_dask_worker_count(task_count):
     return bounded_dask_worker_count(task_count, RSSI_DASK_MAX_WORKERS)
 
 
-def compute_dask_tasks(tasks, use_threads=True):
+def make_dask_progress_callback(delayed_tasks, progress_callback):
+    if progress_callback is None:
+        return nullcontext()
+
+    pending_keys = {getattr(task, "key", None) for task in delayed_tasks}
+    pending_keys.discard(None)
+    if not pending_keys:
+        return nullcontext()
+
+    callback_lock = threading.Lock()
+
+    def posttask(key, _result, _dsk, _state, _worker_id):
+        with callback_lock:
+            if key not in pending_keys:
+                return
+            pending_keys.remove(key)
+        progress_callback(1, key)
+
+    return Callback(posttask=posttask)
+
+
+def compute_dask_tasks(tasks, use_threads=True, progress_callback=None):
     delayed_tasks = list(tasks or [])
     if not delayed_tasks:
         return tuple()
-    if not use_threads:
+    with make_dask_progress_callback(delayed_tasks, progress_callback):
+        if not use_threads:
+            return dask.compute(
+                *delayed_tasks,
+                scheduler="single-threaded",
+            )
+        if len(delayed_tasks) == 1:
+            return (
+                delayed_tasks[0].compute(
+                    scheduler="threads",
+                    num_workers=1,
+                ),
+            )
         return dask.compute(
             *delayed_tasks,
-            scheduler="single-threaded",
+            scheduler="threads",
+            num_workers=rssi_dask_worker_count(len(delayed_tasks)),
         )
-    if len(delayed_tasks) == 1:
-        return (
-            delayed_tasks[0].compute(
-                scheduler="threads",
-                num_workers=1,
-            ),
+
+
+def set_rssi_progress_state(request_id, total_nodes, completed_nodes=0, failed=False):
+    with RSSI_PROGRESS_LOCK:
+        RSSI_PROGRESS_STATE[int(request_id)] = {
+            "total_nodes": max(int(total_nodes), 0),
+            "completed_nodes": max(int(completed_nodes), 0),
+            "failed": bool(failed),
+        }
+
+
+def increment_rssi_progress_state(request_id, delta=1):
+    with RSSI_PROGRESS_LOCK:
+        state = RSSI_PROGRESS_STATE.setdefault(
+            int(request_id),
+            {"total_nodes": 0, "completed_nodes": 0, "failed": False},
         )
-    return dask.compute(
-        *delayed_tasks,
-        scheduler="threads",
-        num_workers=rssi_dask_worker_count(len(delayed_tasks)),
-    )
+        state["completed_nodes"] = max(int(state.get("completed_nodes", 0)) + int(delta), 0)
+
+
+def get_rssi_progress_state(request_id):
+    with RSSI_PROGRESS_LOCK:
+        state = RSSI_PROGRESS_STATE.get(int(request_id))
+        return dict(state) if state is not None else None
 
 
 def numba_parallel_threads_safe():
@@ -3405,7 +3778,7 @@ def compute_observer_projected_rssi(
         observer_row, observer_col, _obs_x, _obs_y, _obs_z = snap_point(observer.x, observer.y)
         visible_rows, visible_cols = np.nonzero(visible_mask)
         if visible_rows.size:
-            chunk_rows, chunk_cols, chunk_losses = compute_ground_loss_for_chunk(
+            chunk_rows, chunk_cols, chunk_losses, chunk_visible = compute_ground_loss_visibility_for_chunk(
                 (
                     observer_row,
                     observer_col,
@@ -3418,6 +3791,7 @@ def compute_observer_projected_rssi(
                 use_parallel_numba=use_parallel_ground_loss_numba,
             )
             ground_loss_db[chunk_rows, chunk_cols] = chunk_losses
+            visible_mask[chunk_rows, chunk_cols] = chunk_visible
 
     observer_rssi = np.where(
         visible_mask,
@@ -3439,22 +3813,27 @@ def compute_observer_projected_rssi(
 
 
 def reproject_projected_rssi_to_display(observer_rssi, bundle):
-    display_rssi = np.full(bundle["terrain_display_shape"], np.nan, dtype=np.float32)
+    display_shape = bundle.get("map_display_shape", bundle["terrain_display_shape"])
+    display_transform = bundle.get("map_display_transform", bundle["terrain_display_transform"])
+    display_lon_axis = bundle.get("map_display_lon_axis", bundle["terrain_display_lon_axis"])
+    display_lat_axis = bundle.get("map_display_lat_axis", bundle["terrain_display_lat_axis"])
+    display_crs = WEB_MERCATOR_CRS if "map_display_transform" in bundle else GEOGRAPHIC_CRS
+    display_rssi = np.full(display_shape, np.nan, dtype=np.float32)
     safe_reproject(
         source=np.asarray(observer_rssi, dtype=np.float32),
         destination=display_rssi,
         src_transform=bundle["projected_transform"],
         src_crs=PROJECTED_CRS,
         src_nodata=np.nan,
-        dst_transform=bundle["terrain_display_transform"],
-        dst_crs=GEOGRAPHIC_CRS,
+        dst_transform=display_transform,
+        dst_crs=display_crs,
         dst_nodata=np.nan,
-        resampling=Resampling.bilinear,
+        resampling=Resampling.nearest,
     )
     return {
-        "max_rssi": np.flipud(display_rssi),
-        "lon_axis": bundle["terrain_display_lon_axis"],
-        "lat_axis": bundle["terrain_display_lat_axis"][::-1],
+        "max_rssi": display_rssi,
+        "lon_axis": display_lon_axis,
+        "lat_axis": display_lat_axis,
     }
 
 
@@ -4444,6 +4823,21 @@ app.layout = [
                                     dcc.Input(id="max_lon", type="number", value=DEFAULT_BBOX["max_lon"], style={"width": "100%"}),
                                     html.Div("Maximum latitude (north boundary)", style={"fontSize": "12px", "color": "#cbd5e1"}),
                                     dcc.Input(id="max_lat", type="number", value=DEFAULT_BBOX["max_lat"], style={"width": "100%"}),
+                                    html.Div("BBox resolution (m/pixel)", style={"fontSize": "12px", "color": "#cbd5e1"}),
+                                    dcc.Slider(
+                                        MIN_BBOX_RESOLUTION_M,
+                                        MAX_BBOX_RESOLUTION_M,
+                                        step=BBOX_RESOLUTION_STEP_M,
+                                        value=DEFAULT_BBOX_RESOLUTION_M,
+                                        id="bbox-resolution-m",
+                                        marks={
+                                            int(MIN_BBOX_RESOLUTION_M): "50",
+                                            100: "100",
+                                            150: "150",
+                                            int(MAX_BBOX_RESOLUTION_M): "200",
+                                        },
+                                        updatemode="mouseup",
+                                    ),
                                     html.Button(
                                         "Set Terrain Bounding Box",
                                         id="toggle-terrain-bbox",
@@ -4942,8 +5336,9 @@ def update_bbox_store(_n_clicks, min_lon, min_lat, max_lon, max_lat, camera_revi
     Output("elevation_clip_range", "value"),
     Output("elevation_clip_range", "marks"),
     Input("bbox-store", "data"),
+    Input("bbox-resolution-m", "value"),
 )
-def update_elevation_clip_controls(bbox_data):
+def update_elevation_clip_controls(bbox_data, bbox_resolution_m):
     if not bbox_data:
         return 0, 1, [0, 1], {0: "0", 1: "1"}
 
@@ -4954,7 +5349,7 @@ def update_elevation_clip_controls(bbox_data):
             bbox_data["max_lon"],
             bbox_data["max_lat"],
         )
-        bundle = get_map_bundle(*bbox)
+        bundle = get_map_bundle(*bbox, bbox_resolution_m)
         terrain_display = np.flipud(bundle["terrain_display"])
         finite = terrain_display[np.isfinite(terrain_display)]
         if finite.size == 0:
@@ -4979,9 +5374,10 @@ def update_elevation_clip_controls(bbox_data):
     Input("clip-visible-elevation-range", "n_clicks"),
     State("map-view-store", "data"),
     State("bbox-store", "data"),
+    State("bbox-resolution-m", "value"),
     prevent_initial_call=True,
 )
-def set_elevation_clip_to_current_view(_n_clicks, map_view_data, bbox_data):
+def set_elevation_clip_to_current_view(_n_clicks, map_view_data, bbox_data, bbox_resolution_m):
     if not bbox_data:
         raise PreventUpdate
 
@@ -4991,7 +5387,7 @@ def set_elevation_clip_to_current_view(_n_clicks, map_view_data, bbox_data):
         bbox_data["max_lon"],
         bbox_data["max_lat"],
     )
-    bundle = get_map_bundle(*bbox)
+    bundle = get_map_bundle(*bbox, bbox_resolution_m)
 
     terrain_lon = bundle["terrain_display_lon_axis"]
     terrain_lat = bundle["terrain_display_lat_axis"][::-1]
@@ -5027,10 +5423,11 @@ def set_elevation_clip_to_current_view(_n_clicks, map_view_data, bbox_data):
 @app.callback(
     Output("top-banner-container", "children"),
     Input("bbox-store", "data"),
+    Input("bbox-resolution-m", "value"),
     Input("nodes-store", "data"),
     Input("rssi-calculation-store", "data"),
 )
-def update_top_banner(bbox_data, nodes, calculation_store):
+def update_top_banner(bbox_data, bbox_resolution_m, nodes, calculation_store):
     outside_nodes = nodes_outside_loaded_bbox(nodes or [], bbox_data) if nodes else []
     if outside_nodes:
         names = ", ".join(outside_nodes[:4])
@@ -5052,6 +5449,18 @@ def update_top_banner(bbox_data, nodes, calculation_store):
             return info_banner(
                 "Nodes have been added or changed since the last RSSI calculation. Re-run RSSI calculations to refresh the overlay."
             )
+        if bbox_data:
+            current_bundle_key = bundle_cache_key(
+                bbox_data["min_lon"],
+                bbox_data["min_lat"],
+                bbox_data["max_lon"],
+                bbox_data["max_lat"],
+                bbox_resolution_m,
+            )
+            if tuple(calculation_store.get("bundle_key", ())) != current_bundle_key:
+                return info_banner(
+                    "Terrain bounds or bbox resolution changed since the last RSSI calculation. Re-run RSSI calculations to refresh the overlay."
+                )
     return None
 
 
@@ -5133,6 +5542,7 @@ def toggle_viewshed_point_mode(_n_clicks, click_mode):
     Input("viewshed-assessment-store", "data"),
     Input("terrain-ready-store", "data"),
     Input("bbox-store", "data"),
+    Input("bbox-resolution-m", "value"),
     Input("viewshed-radius", "value"),
     Input("viewshed-height-agl", "value"),
     Input("viewshed-sample-count", "value"),
@@ -5143,6 +5553,7 @@ def update_viewshed_controls(
     assessment_store,
     terrain_ready,
     bbox_data,
+    bbox_resolution_m,
     viewshed_radius,
     viewshed_height_agl,
     viewshed_sample_count,
@@ -5156,11 +5567,12 @@ def update_viewshed_controls(
     current_bundle_key = None
     if bbox_data:
         try:
-            current_bundle_key = normalize_bbox(
+            current_bundle_key = bundle_cache_key(
                 bbox_data["min_lon"],
                 bbox_data["min_lat"],
                 bbox_data["max_lon"],
                 bbox_data["max_lat"],
+                bbox_resolution_m,
             )
         except Exception:
             current_bundle_key = None
@@ -5573,6 +5985,7 @@ def save_nodes_csv(_n_clicks, nodes):
     Output("native-map-spec-store", "data"),
     Output("native-map-legend", "children"),
     Input("bbox-store", "data"),
+    Input("bbox-resolution-m", "value"),
     Input("bbox-preview-store", "data"),
     Input("viewshed-point-store", "data"),
     Input("viewshed-assessment-store", "data"),
@@ -5600,6 +6013,7 @@ def save_nodes_csv(_n_clicks, nodes):
 )
 def update_native_map_spec(
     bbox_data,
+    bbox_resolution_m,
     bbox_preview_data,
     viewshed_point_data,
     viewshed_assessment_store,
@@ -5639,6 +6053,7 @@ def update_native_map_spec(
     )
     visual_context_key = native_map_visual_context_key(
         bbox_data,
+        bbox_resolution_m,
         terrain_alpha,
         terrain_clip_range,
         worldcover_display,
@@ -5666,7 +6081,7 @@ def update_native_map_spec(
                 bbox_data["max_lon"],
                 bbox_data["max_lat"],
             )
-            bundle = get_map_bundle(*terrain_bbox)
+            bundle = get_map_bundle(*terrain_bbox, bbox_resolution_m)
             if str(rssi_render_mode or "max-rssi") == "best-node":
                 rssi_overlay = resolve_rssi_provider_overlay(
                     bundle,
@@ -5835,9 +6250,13 @@ app.clientside_callback(
     Output("map-interaction-loading-store", "data", allow_duplicate=True),
     Output("map-interaction-loading-message-store", "data", allow_duplicate=True),
     Input("update_graph", "n_clicks"),
+    Input("bbox-resolution-m", "value"),
+    State("bbox-store", "data"),
     prevent_initial_call=True,
 )
-def start_map_loading(_n_clicks):
+def start_map_loading(_n_clicks, _bbox_resolution_m, bbox_data):
+    if ctx.triggered_id == "bbox-resolution-m" and not bbox_data:
+        raise PreventUpdate
     return True, DEFAULT_MAP_LOADING_MESSAGE
 
 
@@ -5870,10 +6289,11 @@ def clear_map_interaction_loading(_ack, is_loading):
     State("map-interaction-loading-store", "data"),
     State("map-interaction-loading-message-store", "data"),
     State("bbox-store", "data"),
+    State("bbox-resolution-m", "value"),
     State("terrain-load-notification-store", "data"),
     prevent_initial_call=True,
 )
-def notify_terrain_load_complete(_ack, is_loading, loading_message, bbox_data, notification_state):
+def notify_terrain_load_complete(_ack, is_loading, loading_message, bbox_data, bbox_resolution_m, notification_state):
     if not is_loading or str(loading_message or "") != DEFAULT_MAP_LOADING_MESSAGE:
         raise PreventUpdate
     ack_value = str(_ack or "")
@@ -5892,7 +6312,8 @@ def notify_terrain_load_complete(_ack, is_loading, loading_message, bbox_data, n
             )
             message = (
                 "Elevation and WorldCover data finished loading for "
-                f"({bbox[0]:.4f}, {bbox[1]:.4f}) to ({bbox[2]:.4f}, {bbox[3]:.4f})."
+                f"({bbox[0]:.4f}, {bbox[1]:.4f}) to ({bbox[2]:.4f}, {bbox[3]:.4f}) "
+                f"at {normalize_bbox_resolution_m(bbox_resolution_m):.0f} m/pixel."
             )
         except Exception:
             pass
@@ -5924,11 +6345,12 @@ def update_map_interaction_overlay_label(message):
     Output("native-map-hover-readout", "children"),
     Input("native-map-hover-store", "data"),
     State("bbox-store", "data"),
+    State("bbox-resolution-m", "value"),
     State("nodes-store", "data"),
     State("rssi-calculation-store", "data"),
     State("rssi-overlay-selection-store", "data"),
 )
-def update_native_map_hover_readout(hover_data, bbox_data, nodes, calculation_store, overlay_selection_store):
+def update_native_map_hover_readout(hover_data, bbox_data, bbox_resolution_m, nodes, calculation_store, overlay_selection_store):
     if not hover_data:
         return "Move the cursor over the map to inspect coordinates, elevation, and RSSI."
 
@@ -5958,7 +6380,7 @@ def update_native_map_hover_readout(hover_data, bbox_data, nodes, calculation_st
                 bbox_data["max_lon"],
                 bbox_data["max_lat"],
             )
-            bundle = get_map_bundle(*bbox)
+            bundle = get_map_bundle(*bbox, bbox_resolution_m)
             terrain_value = sample_grid_value(
                 bundle["terrain_display"],
                 bundle["terrain_display_lon_axis"],
@@ -5997,6 +6419,7 @@ def update_native_map_hover_readout(hover_data, bbox_data, nodes, calculation_st
     Input("run-viewshed-assessment", "n_clicks"),
     State("viewshed-point-store", "data"),
     State("bbox-store", "data"),
+    State("bbox-resolution-m", "value"),
     State("viewshed-radius", "value"),
     State("viewshed-height-agl", "value"),
     State("viewshed-sample-count", "value"),
@@ -6006,6 +6429,7 @@ def generate_viewshed_assessment(
     run_clicks,
     point_data,
     bbox_data,
+    bbox_resolution_m,
     viewshed_radius,
     viewshed_height_agl,
     viewshed_sample_count,
@@ -6028,7 +6452,7 @@ def generate_viewshed_assessment(
             bbox_data["max_lon"],
             bbox_data["max_lat"],
         )
-        bundle = get_map_bundle(*bbox)
+        bundle = get_map_bundle(*bbox, bbox_resolution_m)
         cache_key, result = compute_viewshed_assessment(
             point_data,
             bundle,
@@ -6088,6 +6512,7 @@ def update_node_summary(nodes, selected_node_ids, _calculation_store, overlay_se
     Output("map-interaction-loading-message-store", "data", allow_duplicate=True),
     Input("rssi-run-request-store", "data"),
     State("bbox-store", "data"),
+    State("bbox-resolution-m", "value"),
     State("nodes-store", "data"),
     State("rssi-overlay-selection-store", "data"),
     State("global-rx-height-agl", "value"),
@@ -6099,6 +6524,7 @@ def update_node_summary(nodes, selected_node_ids, _calculation_store, overlay_se
 def generate_rssi_overlay(
     run_request,
     bbox_data,
+    bbox_resolution_m,
     nodes,
     existing_overlay_selection,
     global_rx_height_agl,
@@ -6139,7 +6565,7 @@ def generate_rssi_overlay(
         bbox_data["max_lon"],
         bbox_data["max_lat"],
     )
-    bundle = get_map_bundle(*bbox)
+    bundle = get_map_bundle(*bbox, bbox_resolution_m)
     include_ground_loss = "enabled" in (include_rssi_ground_loss or [])
     rx_height = global_rx_height_agl or DEFAULT_GLOBAL_RX_HEIGHT_M
     rx_gain = global_rx_gain_dbi or DEFAULT_RX_GAIN_DBI
@@ -6147,11 +6573,11 @@ def generate_rssi_overlay(
     node_overlay_keys = {}
     node_signatures = {}
     started_at = time.perf_counter()
+    set_rssi_progress_state(request_id, len(nodes), completed_nodes=0, failed=False)
     try:
         ensure_analysis_context(bundle)
         use_parallel_ground_loss_numba = include_ground_loss and numba_parallel_threads_safe()
         progress = tqdm(
-            nodes,
             total=len(nodes),
             desc="RSSI overlay",
             unit="node",
@@ -6159,7 +6585,7 @@ def generate_rssi_overlay(
             leave=True,
         )
         try:
-            scheduled_nodes = [with_node_defaults(node) for node in progress]
+            scheduled_nodes = [with_node_defaults(node) for node in nodes]
             overlay_tasks = [
                 dask.delayed(compute_single_node_rssi_overlay_result)(
                     node,
@@ -6172,7 +6598,15 @@ def generate_rssi_overlay(
                 )
                 for node in scheduled_nodes
             ]
-            overlay_results = compute_dask_tasks(overlay_tasks, use_threads=True)
+            def on_task_progress(delta, _task_key):
+                progress.update(int(delta))
+                increment_rssi_progress_state(request_id, delta=int(delta))
+
+            overlay_results = compute_dask_tasks(
+                overlay_tasks,
+                use_threads=True,
+                progress_callback=on_task_progress,
+            )
             for node, (cache_key, overlay_result) in zip(scheduled_nodes, overlay_results, strict=False):
                 RSSI_OVERLAY_CACHE[cache_key] = overlay_result
                 node_id = str(node["id"])
@@ -6182,6 +6616,7 @@ def generate_rssi_overlay(
             if hasattr(progress, "close"):
                 progress.close()
     except Exception as exc:
+        set_rssi_progress_state(request_id, len(nodes), completed_nodes=0, failed=True)
         return (
             no_update,
             no_update,
@@ -6191,6 +6626,7 @@ def generate_rssi_overlay(
             False,
             DEFAULT_MAP_LOADING_MESSAGE,
         )
+    set_rssi_progress_state(request_id, len(nodes), completed_nodes=len(nodes), failed=False)
 
     calc_store = {
         "request_id": request_id,
@@ -6244,7 +6680,19 @@ def update_rssi_progress(_n_intervals, progress_meta, progress_complete):
         return "0", "", True
 
     if progress_complete and progress_complete.get("request_id") == progress_meta.get("request_id"):
+        completed_state = get_rssi_progress_state(progress_meta.get("request_id"))
+        if completed_state and completed_state.get("total_nodes"):
+            total_nodes = int(completed_state["total_nodes"])
+            return "100", f"RSSI overlay complete. {total_nodes}/{total_nodes} nodes finished.", True
         return "100", "RSSI overlay complete.", True
+
+    progress_state = get_rssi_progress_state(progress_meta.get("request_id"))
+    if progress_state and int(progress_state.get("total_nodes", 0)) > 0:
+        total_nodes = int(progress_state["total_nodes"])
+        completed_nodes = min(int(progress_state.get("completed_nodes", 0)), total_nodes)
+        progress = int(round((completed_nodes / max(total_nodes, 1)) * 100))
+        label = f"Computing RSSI overlay... {completed_nodes}/{total_nodes} nodes complete."
+        return str(progress), label, False
 
     start_ms = float(progress_meta.get("start_ms", 0))
     eta_sec = max(float(progress_meta.get("eta_sec", 1)), 1.0)
@@ -6286,12 +6734,21 @@ def collapse_map_bounds(_n_clicks):
     Output("path-profile-stats", "children"),
     Input("point-path-store", "data"),
     Input("selected-node-ids-store", "data"),
+    Input("bbox-resolution-m", "value"),
     State("nodes-store", "data"),
     State("bbox-store", "data"),
     State("global-rx-height-agl", "value"),
     State("global-rx-gain-dbi", "value"),
 )
-def update_path_profile(point_path_data, selected_node_ids, nodes, bbox_data, global_rx_height_agl, global_rx_gain_dbi):
+def update_path_profile(
+    point_path_data,
+    selected_node_ids,
+    bbox_resolution_m,
+    nodes,
+    bbox_data,
+    global_rx_height_agl,
+    global_rx_gain_dbi,
+):
     def build_stats_panel(stats):
         return html.Div(
             [
@@ -6322,7 +6779,7 @@ def update_path_profile(point_path_data, selected_node_ids, nodes, bbox_data, gl
             bbox_data["max_lon"],
             bbox_data["max_lat"],
         )
-        bundle = get_map_bundle(*bbox)
+        bundle = get_map_bundle(*bbox, bbox_resolution_m)
         ensure_analysis_context(bundle)
     except Exception as exc:
         return empty_path_profile_figure(f"Path profile unavailable: {exc}"), html.Div()

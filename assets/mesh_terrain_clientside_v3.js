@@ -1095,11 +1095,6 @@
         url: layerSpec.image,
         coordinates: layerSpec.coordinates,
       });
-    } else if (previousSignature !== sourceSignature && typeof existingSource.updateImage === "function") {
-      existingSource.updateImage({
-        url: layerSpec.image,
-        coordinates: layerSpec.coordinates,
-      });
     } else if (previousSignature !== sourceSignature) {
       removeLayerIfPresent(map, layerId);
       removeSourceIfPresent(map, sourceId);
