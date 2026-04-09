@@ -1,0 +1,13 @@
+services:
+  mesh-terrain:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mesh-terrain:latest
+    ports:
+      - "8080:80"
+    environment:
+      GUNICORN_WORKERS: "2"
+      GUNICORN_THREADS: "4"
+      GUNICORN_TIMEOUT: "300"
+    restart: unless-stopped

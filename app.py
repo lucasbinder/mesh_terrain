@@ -4670,6 +4670,7 @@ app.enable_dev_tools(
     dev_tools_hot_reload=False,
 )
 app.title = "Non Flatlander Mesh Terrain Planner (NF-MTP)"
+server = app.server
 
 werkzeug_logger = logging.getLogger("werkzeug")
 if not any(isinstance(existing_filter, SuppressReloadHashFilter) for existing_filter in werkzeug_logger.filters):
