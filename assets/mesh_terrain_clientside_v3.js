@@ -1575,11 +1575,11 @@
   function startRssiOverlay(nClicks, nodes, includeGroundLoss) {
     const noUpdate = window.dash_clientside.no_update;
     if (!nClicks) {
-      return [noUpdate, noUpdate, noUpdate, noUpdate, noUpdate, noUpdate];
+      return [noUpdate, noUpdate, noUpdate, noUpdate, noUpdate, noUpdate, noUpdate];
     }
     const nodeCount = (nodes || []).length;
     if (!nodeCount) {
-      return [noUpdate, true, noUpdate, noUpdate, false, "Updating map..."];
+      return [noUpdate, true, noUpdate, noUpdate, noUpdate, false, "Updating map..."];
     }
     const expensive = (includeGroundLoss || []).includes("enabled");
     const eta = expensive ? Math.max(10, nodeCount * 18) : Math.max(4, nodeCount * 3);
@@ -1591,6 +1591,7 @@
         eta_sec: eta,
       },
       false,
+      "rssi",
       null,
       {
         request_id: requestId,
@@ -1598,6 +1599,224 @@
       true,
       "Performing RSSI and LOS Calculations",
     ];
+  }
+
+  function hiddenProgressState() {
+    return ["", {display: "none"}, {width: "0%"}];
+  }
+
+  function getProgressRuntime() {
+    if (!window.__meshTerrainProgressRuntime) {
+      window.__meshTerrainProgressRuntime = {
+        token: null,
+        snapshot: null,
+        pending: false,
+        lastRequestMs: 0,
+      };
+    }
+    return window.__meshTerrainProgressRuntime;
+  }
+
+  function normalizeProgressValue(value) {
+    const progress = Number(value);
+    if (!Number.isFinite(progress)) {
+      return 0;
+    }
+    return Math.max(0, Math.min(100, Math.round(progress)));
+  }
+
+  function buildProgressStateFromPayload(payload) {
+    const normalized = payload || {};
+    const showProgress = normalized.show_progress !== false;
+    return [
+      String(normalized.label || ""),
+      showProgress ? {display: "block"} : {display: "none"},
+      {width: `${normalizeProgressValue(normalized.progress)}%`},
+    ];
+  }
+
+  function formatProgressDuration(seconds) {
+    const totalSeconds = Math.max(Math.round(Number(seconds || 0)), 0);
+    if (totalSeconds < 60) {
+      return `${totalSeconds}s`;
+    }
+    const minutes = Math.floor(totalSeconds / 60);
+    const remainingSeconds = totalSeconds % 60;
+    if (minutes < 60) {
+      return `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s`;
+    }
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return `${hours}h ${String(remainingMinutes).padStart(2, "0")}m`;
+  }
+
+  function buildRssiLabel(snapshot, elapsedSec, remainingSec) {
+    const completed = Number(snapshot.completed_nodes || 0);
+    const total = Number(snapshot.total_nodes || 0);
+    const workerCount = Number(snapshot.worker_count || 0);
+    const workerLabel = workerCount === 1 ? "worker" : "workers";
+    const status = String(snapshot.status || "");
+    if (status === "complete") {
+      return total > 0
+        ? `RSSI overlay complete. ${total}/${total} nodes finished.`
+        : "RSSI overlay complete.";
+    }
+    if (status === "initializing") {
+      return elapsedSec > 0
+        ? `Computing RSSI overlay... Initializing workers. ${formatProgressDuration(elapsedSec)} elapsed.`
+        : "Computing RSSI overlay... Initializing workers.";
+    }
+    if (status === "estimating" || completed <= 0) {
+      const base = `Computing RSSI overlay... 0/${total} nodes complete on ${workerCount} ${workerLabel}.`;
+      return elapsedSec > 0
+        ? `${base} ${formatProgressDuration(elapsedSec)} elapsed. Estimating remaining time...`
+        : base;
+    }
+    const base = `Computing RSSI overlay... ${completed}/${total} nodes complete on ${workerCount} ${workerLabel}.`;
+    if (remainingSec === null || remainingSec === undefined) {
+      return `${base} ${formatProgressDuration(elapsedSec)} elapsed.`;
+    }
+    return `${base} ${formatProgressDuration(elapsedSec)} elapsed, ETA ${formatProgressDuration(remainingSec)}.`;
+  }
+
+  function buildProgressStateFromSnapshot(snapshot) {
+    if (!snapshot) {
+      return hiddenProgressState();
+    }
+    if (String(snapshot.kind || "") === "rssi") {
+      const fetchedAtMs = Number(snapshot.fetched_at_ms || Date.now());
+      const deltaSec = Math.max((Date.now() - fetchedAtMs) / 1000, 0);
+      const elapsedSec = Math.max(Number(snapshot.elapsed_sec || 0) + deltaSec, 0);
+      let remainingSec = snapshot.remaining_sec;
+      if (remainingSec !== null && remainingSec !== undefined) {
+        remainingSec = Math.max(Number(remainingSec) - deltaSec, 0);
+      }
+      return [
+        buildRssiLabel(snapshot, elapsedSec, remainingSec),
+        snapshot.show_progress === false ? {display: "none"} : {display: "block"},
+        {width: `${normalizeProgressValue(snapshot.progress)}%`},
+      ];
+    }
+    return buildProgressStateFromPayload(snapshot);
+  }
+
+  function updateProgressSnapshot(token, params) {
+    const runtime = getProgressRuntime();
+    if (runtime.pending) {
+      return;
+    }
+    const now = Date.now();
+    if (runtime.token === token && runtime.snapshot && (now - runtime.lastRequestMs) < 450) {
+      return;
+    }
+    runtime.pending = true;
+    runtime.lastRequestMs = now;
+    fetch(`/progress-status?${params.toString()}`, {
+      cache: "no-store",
+      credentials: "same-origin",
+    })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`Progress request failed with status ${response.status}`);
+        }
+        return response.json();
+      })
+      .then((payload) => {
+        runtime.token = token;
+        runtime.snapshot = Object.assign({}, payload, {fetched_at_ms: Date.now()});
+      })
+      .catch((_error) => {
+        if (runtime.token !== token) {
+          runtime.snapshot = null;
+        }
+      })
+      .finally(() => {
+        runtime.pending = false;
+      });
+  }
+
+  function buildFallbackRssiProgress(rssiProgressMeta, rssiProgressComplete) {
+    if (!rssiProgressMeta || !rssiProgressMeta.request_id) {
+      return hiddenProgressState();
+    }
+    if (
+      rssiProgressComplete &&
+      rssiProgressComplete.done &&
+      Number(rssiProgressComplete.request_id) === Number(rssiProgressMeta.request_id)
+    ) {
+      return [
+        "RSSI overlay complete.",
+        {display: "block"},
+        {width: "100%"},
+      ];
+    }
+    const startMs = Number(rssiProgressMeta.start_ms || 0);
+    const etaSec = Math.max(Number(rssiProgressMeta.eta_sec || 0), 0);
+    if (!(startMs > 0) || !(etaSec > 0)) {
+      return [
+        "Computing RSSI overlay...",
+        {display: "block"},
+        {width: "0%"},
+      ];
+    }
+    const elapsedSec = Math.max((Date.now() - startMs) / 1000, 0);
+    const progress = Math.min(95, normalizeProgressValue((elapsedSec / etaSec) * 100));
+    const remainingSec = Math.max(Math.round(etaSec - elapsedSec), 0);
+    return [
+      `Computing RSSI overlay... ${Math.round(elapsedSec)}s elapsed, ETA ${remainingSec}s.`,
+      {display: "block"},
+      {width: `${progress}%`},
+    ];
+  }
+
+  function pollMapInteractionProgress(
+    _nIntervals,
+    progressMode,
+    terrainProgressMeta,
+    rssiProgressMeta
+  ) {
+    const mode = String(progressMode || "");
+    if (!mode) {
+      return hiddenProgressState();
+    }
+
+    let params = null;
+    if (mode === "terrain" && terrainProgressMeta && terrainProgressMeta.bundle_key) {
+      params = new URLSearchParams({
+        kind: "terrain",
+        bundle_key: JSON.stringify(terrainProgressMeta.bundle_key),
+      });
+    } else if (mode === "rssi" && rssiProgressMeta && rssiProgressMeta.request_id) {
+      params = new URLSearchParams({
+        kind: "rssi",
+        request_id: String(rssiProgressMeta.request_id),
+      });
+      if (rssiProgressMeta.start_ms !== undefined && rssiProgressMeta.start_ms !== null) {
+        params.set("start_ms", String(rssiProgressMeta.start_ms));
+      }
+      if (rssiProgressMeta.eta_sec !== undefined && rssiProgressMeta.eta_sec !== null) {
+        params.set("eta_sec", String(rssiProgressMeta.eta_sec));
+      }
+    } else {
+      return hiddenProgressState();
+    }
+
+    const token = `${mode}:${params.toString()}`;
+    const runtime = getProgressRuntime();
+    if (runtime.token !== token) {
+      runtime.token = token;
+      runtime.snapshot = null;
+      runtime.pending = false;
+      runtime.lastRequestMs = 0;
+    }
+    updateProgressSnapshot(token, params);
+    if (runtime.snapshot) {
+      return buildProgressStateFromSnapshot(runtime.snapshot);
+    }
+    if (mode === "rssi") {
+      return buildFallbackRssiProgress(rssiProgressMeta, null);
+    }
+    return hiddenProgressState();
   }
 
   function applyManualNodeEntry(nClicks, manualName, manualLon, manualLat, nodes, counter, selectedNodeIds) {
@@ -1647,6 +1866,7 @@
   window.dash_clientside = Object.assign({}, window.dash_clientside);
   window.dash_clientside.clientside = Object.assign({}, window.dash_clientside.clientside, {
     renderNativeMap: renderNativeMap,
+    pollMapInteractionProgress: pollMapInteractionProgress,
     startRssiOverlay: startRssiOverlay,
     applyManualNodeEntry: applyManualNodeEntry,
   });
