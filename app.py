@@ -41,6 +41,7 @@ from rasterio.errors import NotGeoreferencedWarning
 from rasterio.io import MemoryFile
 from rasterio.warp import Resampling, reproject, transform, transform_bounds
 from scipy.interpolate import RBFInterpolator
+from urllib3.util.retry import Retry
 try:
     from tqdm import tqdm
 except ModuleNotFoundError:
@@ -72,6 +73,7 @@ WEB_MERCATOR_CRS = "EPSG:3857"
 WORLDCOVER_BASE_URL = "https://esa-worldcover.s3.eu-central-1.amazonaws.com"
 WORLDCOVER_VERSION = "v200"
 WORLDCOVER_YEAR = "2021"
+ELEVATION_WCS_URL = "https://elevation.nationalmap.gov/arcgis/services/3DEPElevation/ImageServer/WCSServer"
 OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 AWS_TERRAIN_TILE_URL = "https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png"
 OSM_TILE_SIZE = 256
@@ -174,6 +176,7 @@ DEFAULT_3D_PITCH = 60.0
 DEFAULT_3D_BEARING = 20.0
 DEFAULT_MAP_LOADING_MESSAGE = "Loading Terrain and WorldCover Data..."
 RSSI_MAP_LOADING_MESSAGE = "Performing RSSI and LOS Calculations"
+LOGGER = logging.getLogger(__name__)
 RSSI_RENDER_MODE_OPTIONS = [
     {"label": "Show max RSSI", "value": "max-rssi"},
     {"label": "Color by strongest node", "value": "best-node"},
@@ -601,9 +604,40 @@ def native_map_visual_context_key(
 
 
 def fetch_binary_with_headers(url, headers=None, timeout=240):
-    response = requests.get(url, timeout=timeout, headers=headers)
-    response.raise_for_status()
-    return response.content
+    merged_headers = dict(REMOTE_FETCH_HEADERS)
+    if headers:
+        merged_headers.update(headers)
+    response = None
+    try:
+        response = remote_requests_session().get(url, timeout=timeout, headers=merged_headers)
+        response.raise_for_status()
+        return response.content
+    except Exception:
+        LOGGER.exception("Failed to fetch remote raster from %s", url)
+        if response is not None:
+            try:
+                LOGGER.error("Remote raster fetch status=%s body=%s", response.status_code, response.text[:400])
+            except Exception:
+                pass
+        raise
+
+
+@lru_cache(maxsize=1)
+def remote_requests_session():
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=16)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 @contextmanager
@@ -5427,6 +5461,7 @@ app.enable_dev_tools(
     dev_tools_hot_reload=False,
 )
 app.title = "Non Flatlander Mesh Terrain Planner (NF-MTP)"
+server = app.server
 
 werkzeug_logger = logging.getLogger("werkzeug")
 if not any(isinstance(existing_filter, SuppressReloadHashFilter) for existing_filter in werkzeug_logger.filters):
@@ -6184,8 +6219,13 @@ def set_elevation_clip_to_current_view(_n_clicks, map_view_data, bbox_data, bbox
     Input("bbox-resolution-m", "value"),
     Input("nodes-store", "data"),
     Input("rssi-calculation-store", "data"),
+    Input("native-map-spec-store", "data"),
 )
-def update_top_banner(bbox_data, bbox_resolution_m, nodes, calculation_store):
+def update_top_banner(bbox_data, bbox_resolution_m, nodes, calculation_store, native_map_spec):
+    spec_error = str((native_map_spec or {}).get("error") or "").strip()
+    if spec_error:
+        return info_banner(spec_error)
+
     outside_nodes = nodes_outside_loaded_bbox(nodes or [], bbox_data) if nodes else []
     if outside_nodes:
         names = ", ".join(outside_nodes[:4])
@@ -7089,16 +7129,22 @@ def clear_map_interaction_loading(_ack, is_loading):
     State("map-interaction-loading-message-store", "data"),
     State("bbox-store", "data"),
     State("bbox-resolution-m", "value"),
+    State("native-map-spec-store", "data"),
     State("terrain-load-notification-store", "data"),
     prevent_initial_call=True,
 )
-def notify_terrain_load_complete(_ack, is_loading, loading_message, bbox_data, bbox_resolution_m, notification_state):
+def notify_terrain_load_complete(_ack, is_loading, loading_message, bbox_data, bbox_resolution_m, native_map_spec, notification_state):
     if not is_loading or str(loading_message or "") != DEFAULT_MAP_LOADING_MESSAGE:
         raise PreventUpdate
     ack_value = str(_ack or "")
     current_state = notification_state or {}
     if not ack_value or current_state.get("ack") == ack_value:
         raise PreventUpdate
+
+    spec_error = str((native_map_spec or {}).get("error") or "").strip()
+    if spec_error:
+        send_desktop_notification("Terrain Load Failed", spec_error)
+        return {"ack": ack_value, "error": spec_error}
 
     message = "Elevation and WorldCover data finished loading."
     if bbox_data:
@@ -7671,4 +7717,16 @@ def update_path_profile(
 
 
 if __name__ == "__main__":
-    app.run(debug=False, dev_tools_hot_reload=False, use_reloader=False)
+    debug_enabled = env_flag("DASH_DEBUG", default=False)
+    app_host = str(os.environ.get("APP_HOST", "0.0.0.0") or "0.0.0.0")
+    try:
+        app_port = int(os.environ.get("APP_PORT", "8050") or "8050")
+    except (TypeError, ValueError):
+        app_port = 8050
+    app.run(
+        host=app_host,
+        port=app_port,
+        debug=debug_enabled,
+        dev_tools_hot_reload=debug_enabled,
+        use_reloader=debug_enabled,
+    )
